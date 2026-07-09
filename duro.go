@@ -37,6 +37,11 @@
 // is NOT checkpointed (it re-executes on every replay — it must be pure), and
 // UnsafeOperator admits an arbitrary ro operator with no safety guarantees
 // beyond the runtime guards. Both participate in the shape fingerprint.
+//
+// For parallelism, use FanOut: it runs each item as a child workflow on a
+// DBOS queue, which bounds concurrency and distributes work without
+// sacrificing replay determinism — enqueue and await both happen in stream
+// order on the workflow goroutine.
 package duro
 
 import (
@@ -213,6 +218,93 @@ func UnsafeOperator[T, R any](name string, op func(ro.Observable[T]) ro.Observab
 	return Stage[T, R]{name: name, kind: "unsafe", apply: op}
 }
 
+// FanOut is a durable parallel map: each item starts wf as a child workflow
+// on the named DBOS queue, and once the stream completes, results are awaited
+// and emitted downstream in input order. Parallelism, rate limits, and
+// distribution across processes are governed entirely by the queue's
+// configuration — e.g. a queue registered with dbos.WithGlobalConcurrency(4)
+// runs at most four children at a time across all executors:
+//
+//	dbos.RegisterQueue(ctx, "jobs", dbos.WithGlobalConcurrency(4))
+//	...
+//	duro.Pipe3(
+//		duro.Expand("explode", split),
+//		duro.FanOut("process", "jobs", ProcessJob), // ProcessJob: a registered dbos.Workflow
+//		duro.Reduce("merge", merge, seed),
+//	)
+//
+// FanOut is the sanctioned form of concurrency inside a duro pipeline: it is
+// deterministic because children are enqueued in stream order (child workflow
+// IDs derive from the parent's step counter, so a recovered parent re-attaches
+// to its children instead of spawning duplicates) and awaited in that same
+// order (each result is checkpointed in the parent). Every child is itself a
+// durable workflow.
+//
+// On the first child failure, FanOut fails the pipeline with that child's
+// error. Children queued behind it are independent durable workflows and run
+// to completion in the background; cancel them with dbos.CancelWorkflows if
+// that is not what you want.
+func FanOut[T, R any](name string, queueName string, wf dbos.Workflow[T, R]) Stage[T, R] {
+	mustValidStage("FanOut", name, wf == nil)
+	if queueName == "" {
+		panic(fmt.Sprintf("duro: FanOut stage %q requires a queue name", name))
+	}
+	return Stage[T, R]{name: name, kind: "fanout", apply: func(source ro.Observable[T]) ro.Observable[R] {
+		return ro.NewUnsafeObservableWithContext(func(subCtx context.Context, dest ro.Observer[R]) ro.Teardown {
+			var handles []dbos.WorkflowHandle[R]
+			failed := false
+
+			fail := func(ctx context.Context, err error) {
+				failed = true
+				dest.ErrorWithContext(ctx, err)
+			}
+
+			sub := source.SubscribeWithContext(subCtx, ro.NewObserverWithContext(
+				func(ctx context.Context, in T) {
+					if failed {
+						return
+					}
+					state, err := stageState(ctx, name)
+					if err != nil {
+						fail(ctx, err)
+						return
+					}
+					handle, err := dbos.RunWorkflow(state.dctx, wf, in, dbos.WithQueue(queueName))
+					if err != nil {
+						state.aborted.Store(true)
+						fail(ctx, fmt.Errorf("duro: stage %q: enqueueing child workflow: %w", name, err))
+						return
+					}
+					handles = append(handles, handle)
+				},
+				dest.ErrorWithContext,
+				func(ctx context.Context) {
+					if failed {
+						return
+					}
+					for _, handle := range handles {
+						state, err := stageState(ctx, name)
+						if err != nil {
+							fail(ctx, err)
+							return
+						}
+						result, err := handle.GetResult()
+						if err != nil {
+							state.aborted.Store(true)
+							fail(ctx, fmt.Errorf("duro: stage %q: child workflow %s: %w", name, handle.GetWorkflowID(), err))
+							return
+						}
+						dest.NextWithContext(ctx, result)
+					}
+					dest.CompleteWithContext(ctx)
+				},
+			))
+
+			return sub.Unsubscribe
+		})
+	}}
+}
+
 // pipelineState carries the workflow's DBOSContext, the subscribing
 // goroutine, and a shared abort flag through the observable chain.
 type pipelineState struct {
@@ -223,23 +315,34 @@ type pipelineState struct {
 
 type pipelineStateKey struct{}
 
-// runStep executes fn(in) as a named DBOS step after the runtime safety
-// checks: the pipeline must have been subscribed by Run/RunAll, no earlier
-// stage may have failed, and execution must still be on the subscribing
-// goroutine.
-func runStep[T, R any](ctx context.Context, name string, in T, fn func(context.Context, T) (R, error), opts []StepOption) (R, error) {
-	var zero R
-
+// stageState recovers the pipeline state from the context flowing through the
+// observable chain and performs the runtime safety checks shared by all
+// durable stages: the pipeline must have been subscribed by Run/RunAll, no
+// earlier stage may have failed, and execution must still be on the
+// subscribing goroutine.
+func stageState(ctx context.Context, name string) (*pipelineState, error) {
 	state, _ := ctx.Value(pipelineStateKey{}).(*pipelineState)
 	if state == nil {
-		return zero, fmt.Errorf("duro: stage %q: pipeline was not started by duro.Run/RunAll inside a DBOS workflow", name)
+		return nil, fmt.Errorf("duro: stage %q: pipeline was not started by duro.Run/RunAll inside a DBOS workflow", name)
 	}
 	if state.aborted.Load() {
-		return zero, ErrAborted
+		return nil, ErrAborted
 	}
 	if gid := goroutineID(); gid != state.gid {
 		state.aborted.Store(true)
-		return zero, fmt.Errorf("duro: stage %q executed on goroutine %d but the pipeline was subscribed on goroutine %d — a concurrent or time-based operator is present, which would break deterministic step ordering", name, gid, state.gid)
+		return nil, fmt.Errorf("duro: stage %q executed on goroutine %d but the pipeline was subscribed on goroutine %d — a concurrent or time-based operator is present, which would break deterministic step ordering", name, gid, state.gid)
+	}
+	return state, nil
+}
+
+// runStep executes fn(in) as a named DBOS step after the stageState safety
+// checks.
+func runStep[T, R any](ctx context.Context, name string, in T, fn func(context.Context, T) (R, error), opts []StepOption) (R, error) {
+	var zero R
+
+	state, err := stageState(ctx, name)
+	if err != nil {
+		return zero, err
 	}
 
 	cfg := stepConfig{dbosOpts: []dbos.StepOption{dbos.WithStepName(name)}}

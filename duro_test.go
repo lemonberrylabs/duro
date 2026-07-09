@@ -51,6 +51,14 @@ func TestMain(m *testing.M) {
 	dbos.RegisterWorkflow(ctx, multiValueWorkflow, dbos.WithWorkflowName("multiValueWorkflow"))
 	dbos.RegisterWorkflow(ctx, mutableShapeWorkflow, dbos.WithWorkflowName("mutableShapeWorkflow"))
 	dbos.RegisterWorkflow(ctx, goroutineShiftWorkflow, dbos.WithWorkflowName("goroutineShiftWorkflow"))
+	dbos.RegisterWorkflow(ctx, fanChildSquare, dbos.WithWorkflowName("fanChildSquare"))
+	dbos.RegisterWorkflow(ctx, fanOutWorkflow, dbos.WithWorkflowName("fanOutWorkflow"))
+	dbos.RegisterWorkflow(ctx, fanOutAllWorkflow, dbos.WithWorkflowName("fanOutAllWorkflow"))
+
+	if _, err := dbos.RegisterQueue(ctx, fanQueueName, dbos.WithGlobalConcurrency(fanQueueConcurrency)); err != nil {
+		fmt.Fprintf(os.Stderr, "registering queue: %v\n", err)
+		os.Exit(1)
+	}
 
 	if err := dbos.Launch(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "launching DBOS: %v\n", err)
@@ -288,6 +296,66 @@ func goroutineShiftWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
 			return v * 2, nil
 		}),
 	))
+}
+
+// --- fan-out test workflows --------------------------------------------------
+
+const (
+	fanQueueName        = "duro-test-fanout"
+	fanQueueConcurrency = 4
+)
+
+var (
+	fanChildRuns          atomic.Int64
+	fanChildActive        atomic.Int64
+	fanChildMaxConcurrent atomic.Int64
+)
+
+// fanChildSquare is the child workflow FanOut spawns per item. It tracks how
+// many instances run concurrently so tests can assert the queue's concurrency
+// cap, and sleeps long enough for executions to overlap.
+func fanChildSquare(_ dbos.DBOSContext, n int) (int, error) {
+	fanChildRuns.Add(1)
+	active := fanChildActive.Add(1)
+	defer fanChildActive.Add(-1)
+	for {
+		seen := fanChildMaxConcurrent.Load()
+		if active <= seen || fanChildMaxConcurrent.CompareAndSwap(seen, active) {
+			break
+		}
+	}
+	time.Sleep(40 * time.Millisecond)
+	if n < 0 {
+		return 0, fmt.Errorf("cannot square a grumpy number: %d", n)
+	}
+	return n * n, nil
+}
+
+func fanOutWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
+	return duro.Run(ctx, ns, duro.Pipe3(
+		duro.Expand("explode", func(_ context.Context, xs []int) ([]int, error) {
+			return xs, nil
+		}),
+		duro.FanOut("fan", fanQueueName, fanChildSquare),
+		duro.Reduce("sum", func(_ context.Context, acc, v int) (int, error) {
+			return acc + v, nil
+		}, 0),
+	))
+}
+
+func fanOutAllWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+	return duro.RunAll(ctx, ns, duro.Pipe2(
+		duro.Expand("explode", func(_ context.Context, xs []int) ([]int, error) {
+			return xs, nil
+		}),
+		duro.FanOut("fan", fanQueueName, fanChildSquare),
+	))
+}
+
+func resetFanCounters() {
+	fanChildRuns.Store(0)
+	fanChildActive.Store(0)
+	fanChildMaxConcurrent.Store(0)
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -603,6 +671,92 @@ func TestRunAllCollectsAllValues(t *testing.T) {
 		}
 	}
 	assertNames(t, stepNames(t, wfID), []string{duro.ShapeStepName, "one-to-n", "square", "square", "square", "square"})
+}
+
+// TestFanOutParallelMapReduce proves the headline pattern: 20 jobs fanned out
+// as child workflows on a queue capped at 4 concurrent, results merged by a
+// durable Reduce. The concurrency cap must hold and real overlap must occur.
+func TestFanOutParallelMapReduce(t *testing.T) {
+	resetFanCounters()
+
+	jobs := make([]int, 20)
+	wantSum := 0
+	for i := range jobs {
+		jobs[i] = i + 1
+		wantSum += (i + 1) * (i + 1)
+	}
+
+	result, _ := mustRun(t, fanOutWorkflow, jobs)
+	if result != wantSum {
+		t.Errorf("result = %d, want %d", result, wantSum)
+	}
+	if got := fanChildRuns.Load(); got != 20 {
+		t.Errorf("child executions = %d, want 20", got)
+	}
+	maxSeen := fanChildMaxConcurrent.Load()
+	if maxSeen > fanQueueConcurrency {
+		t.Errorf("max concurrent children = %d, must not exceed the queue cap %d", maxSeen, fanQueueConcurrency)
+	}
+	if maxSeen < 2 {
+		t.Errorf("max concurrent children = %d, want ≥ 2 (no parallelism happened)", maxSeen)
+	}
+}
+
+// TestFanOutPreservesOrder proves results are emitted in input order (not
+// completion order) and shows the checkpoint layout: one child-spawn step per
+// item at enqueue time, then one DBOS.getResult step per awaited child.
+func TestFanOutPreservesOrder(t *testing.T) {
+	resetFanCounters()
+
+	result, wfID := mustRun(t, fanOutAllWorkflow, []int{3, 1, 2})
+	want := []int{9, 1, 4}
+	if len(result) != len(want) {
+		t.Fatalf("result = %v, want %v", result, want)
+	}
+	for i := range want {
+		if result[i] != want[i] {
+			t.Fatalf("result = %v, want %v (input order must be preserved)", result, want)
+		}
+	}
+	assertNames(t, stepNames(t, wfID), []string{
+		duro.ShapeStepName,
+		"explode",
+		"fanChildSquare", "fanChildSquare", "fanChildSquare", // enqueue slots
+		"DBOS.getResult", "DBOS.getResult", "DBOS.getResult", // awaited in order
+	})
+}
+
+// TestFanOutDurabilityRerun proves re-running a completed fan-out workflow ID
+// replays everything: no child workflow executes again.
+func TestFanOutDurabilityRerun(t *testing.T) {
+	resetFanCounters()
+	const wfID = "fanout-durability-rerun"
+
+	first, _ := mustRun(t, fanOutWorkflow, []int{1, 2, 3, 4, 5}, dbos.WithWorkflowID(wfID))
+	runsAfterFirst := fanChildRuns.Load()
+
+	second, _ := mustRun(t, fanOutWorkflow, []int{1, 2, 3, 4, 5}, dbos.WithWorkflowID(wfID))
+	if first != second {
+		t.Errorf("rerun result = %d, want recorded result %d", second, first)
+	}
+	if got := fanChildRuns.Load(); got != runsAfterFirst {
+		t.Errorf("child executions changed on rerun: %d → %d (children re-executed instead of replayed)", runsAfterFirst, got)
+	}
+}
+
+// TestFanOutChildFailure proves a failing child fails the parent pipeline
+// with an error identifying the stage and child workflow.
+func TestFanOutChildFailure(t *testing.T) {
+	resetFanCounters()
+
+	handle, err := dbos.RunWorkflow(dctx, fanOutWorkflow, []int{1, -2, 3})
+	if err != nil {
+		t.Fatalf("starting workflow: %v", err)
+	}
+	_, err = handle.GetResult()
+	if err == nil || !strings.Contains(err.Error(), `stage "fan"`) || !strings.Contains(err.Error(), "grumpy") {
+		t.Fatalf("workflow error = %v, want the fan stage's child failure", err)
+	}
 }
 
 type complexCounts struct {

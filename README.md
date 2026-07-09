@@ -130,6 +130,7 @@ DBOS_SYSTEM_DATABASE_URL=postgres://$USER@localhost:5432/quickstart go run .
 | `duro.Filter(name, pred)` | drop items failing the predicate | ✅ predicate is a step |
 | `duro.Expand(name, fn)` | one item → many (`T → []R`), emitted in order | ✅ checkpointed step |
 | `duro.Reduce(name, fn, seed)` | fold the stream; emits the final accumulator | ✅ one step per accumulation |
+| `duro.FanOut(name, queue, wf)` | parallel map: each item runs as a child workflow on a DBOS queue | ✅ every child is a durable workflow |
 | `duro.Pure(name, fn)` | cheap reshaping between stages | ❌ re-executes on replay — must be deterministic and side-effect free |
 | `duro.UnsafeOperator(name, op)` | escape hatch for raw ro operators | ⚠️ you're on your own (runtime guards still apply) |
 
@@ -166,6 +167,33 @@ func InvoiceWorkflow(ctx dbos.DBOSContext, b Batch) (Invoice, error) {
 	))
 }
 ```
+
+### Parallel fan-out
+
+Need "20 jobs, at most 4 at a time, merge the results"? `FanOut` runs each
+item as a **child workflow** on a DBOS queue, so parallelism, rate limits, and
+distribution across processes are all governed by the queue — and every child
+is independently durable:
+
+```go
+// At startup:
+dbos.RegisterQueue(dctx, "jobs", dbos.WithGlobalConcurrency(4))
+
+func ProcessAll(ctx dbos.DBOSContext, jobs []Job) (Merged, error) {
+	return duro.Run(ctx, jobs, duro.Pipe3(
+		duro.Expand("explode", func(_ context.Context, js []Job) ([]Job, error) { return js, nil }),
+		duro.FanOut("process", "jobs", ProcessJob), // ProcessJob: a registered dbos.Workflow
+		duro.Reduce("merge", mergeResults, Merged{}),
+	))
+}
+```
+
+Children are enqueued in stream order with IDs derived from the parent's step
+counter, so a recovered parent re-attaches to its children instead of spawning
+duplicates; results are awaited and emitted in input order, each checkpointed
+in the parent. This is the sanctioned form of concurrency inside a pipeline —
+determinism is preserved because DBOS checkpoints both the spawns and the
+awaits.
 
 ## Built-in safety
 

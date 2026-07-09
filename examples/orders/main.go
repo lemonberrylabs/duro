@@ -18,7 +18,7 @@ const (
 )
 
 func main() {
-	variant := flag.String("variant", "all", "demo to run: plain | duro | batch | all")
+	variant := flag.String("variant", "all", "demo to run: plain | duro | batch | fanout | all")
 	crashAfter := flag.String("crash-after", "", "simulate a crash after the named order step (reserve or charge); rerun without this flag to watch recovery")
 	flag.Parse()
 	crashAfterStep = *crashAfter
@@ -35,6 +35,11 @@ func main() {
 	dbos.RegisterWorkflow(dctx, OrderWorkflow, dbos.WithWorkflowName("OrderWorkflow"))
 	dbos.RegisterWorkflow(dctx, OrderWorkflowRo, dbos.WithWorkflowName("OrderWorkflowRo"))
 	dbos.RegisterWorkflow(dctx, BatchInvoiceWorkflow, dbos.WithWorkflowName("BatchInvoiceWorkflow"))
+	dbos.RegisterWorkflow(dctx, BatchInvoiceFanOutWorkflow, dbos.WithWorkflowName("BatchInvoiceFanOutWorkflow"))
+	dbos.RegisterWorkflow(dctx, PriceItemWorkflow, dbos.WithWorkflowName("PriceItemWorkflow"))
+	if _, err := dbos.RegisterQueue(dctx, pricingQueueName, dbos.WithGlobalConcurrency(2)); err != nil {
+		fatal("registering pricing queue: %v", err)
+	}
 
 	if err := dbos.Launch(dctx); err != nil {
 		fatal("launching DBOS: %v", err)
@@ -68,26 +73,35 @@ func main() {
 
 	if *variant == "batch" || *variant == "all" {
 		section("Complex duro pipeline — Expand → Filter → Step → Tap → Reduce")
-		batch := Batch{
-			ID: fmt.Sprintf("batch-%d", runID),
-			Items: []LineItem{
-				{SKU: "beans-1kg", Qty: 3, UnitCents: 1800, InStock: true},
-				{SKU: "filter-papers", Qty: 10, UnitCents: 450, InStock: true},
-				{SKU: "gold-tamper", Qty: 1, UnitCents: 9900, InStock: false},
-				{SKU: "milk-jug", Qty: 2, UnitCents: 2200, InStock: true},
-			},
-		}
-		handle, err := dbos.RunWorkflow(dctx, BatchInvoiceWorkflow, batch)
-		if err != nil {
-			fatal("starting batch workflow: %v", err)
-		}
-		invoice, err := handle.GetResult()
-		if err != nil {
-			fatal("batch workflow failed: %v", err)
-		}
-		fmt.Printf("   result: invoice for %s — %d items, %d¢ total\n", invoice.BatchID, invoice.ItemCount, invoice.TotalCents)
-		printSteps(dctx, handle.GetWorkflowID())
+		runBatch(dctx, BatchInvoiceWorkflow, fmt.Sprintf("batch-%d", runID))
 	}
+
+	if *variant == "fanout" || *variant == "all" {
+		section("Parallel fan-out — items priced by child workflows on a queue (2 at a time)")
+		runBatch(dctx, BatchInvoiceFanOutWorkflow, fmt.Sprintf("fanout-%d", runID))
+	}
+}
+
+func runBatch(dctx dbos.DBOSContext, wf dbos.Workflow[Batch, Invoice], batchID string) {
+	batch := Batch{
+		ID: batchID,
+		Items: []LineItem{
+			{SKU: "beans-1kg", Qty: 3, UnitCents: 1800, InStock: true},
+			{SKU: "filter-papers", Qty: 10, UnitCents: 450, InStock: true},
+			{SKU: "gold-tamper", Qty: 1, UnitCents: 9900, InStock: false},
+			{SKU: "milk-jug", Qty: 2, UnitCents: 2200, InStock: true},
+		},
+	}
+	handle, err := dbos.RunWorkflow(dctx, wf, batch)
+	if err != nil {
+		fatal("starting batch workflow: %v", err)
+	}
+	invoice, err := handle.GetResult()
+	if err != nil {
+		fatal("batch workflow failed: %v", err)
+	}
+	fmt.Printf("   result: invoice for %s — %d items, %d¢ total\n", invoice.BatchID, invoice.ItemCount, invoice.TotalCents)
+	printSteps(dctx, handle.GetWorkflowID())
 }
 
 func runOrder(dctx dbos.DBOSContext, wf dbos.Workflow[Order, Confirmation], order Order, opts ...dbos.WorkflowOption) {
@@ -160,7 +174,11 @@ func printSteps(dctx dbos.DBOSContext, workflowID string) {
 		if s.Error != nil {
 			status = "✗ " + s.Error.Error()
 		}
-		fmt.Printf("      %2d  %-14s %s  (completed %s)\n", s.StepID, s.StepName, status, s.CompletedAt.Format("15:04:05.000"))
+		when := "child workflow " + s.ChildWorkflowID
+		if !s.CompletedAt.IsZero() {
+			when = "completed " + s.CompletedAt.Format("15:04:05.000")
+		}
+		fmt.Printf("      %2d  %-17s %s  (%s)\n", s.StepID, s.StepName, status, when)
 	}
 }
 
