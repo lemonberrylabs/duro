@@ -38,10 +38,16 @@
 // UnsafeOperator admits an arbitrary ro operator with no safety guarantees
 // beyond the runtime guards. Both participate in the shape fingerprint.
 //
-// For parallelism, use FanOut: it runs each item as a child workflow on a
-// DBOS queue, which bounds concurrency and distributes work without
-// sacrificing replay determinism — enqueue and await both happen in stream
-// order on the workflow goroutine.
+// For parallelism, use FanOut (child workflows on a DBOS queue — bounded,
+// distributed, per-child durability) or Parallel (concurrent steps in-process
+// via dbos.Go — lightweight, no queue). Both preserve replay determinism:
+// work is spawned and awaited in stream order on the workflow goroutine.
+//
+// The rest of DBOS's workflow toolkit is available as stages: Delay (durable
+// sleep), Send/Recv (durable mailbox messaging — external signals and
+// human-in-the-loop pauses), SetEvent (progress events readable via
+// dbos.GetEvent), and ToStream (durable streams readable incrementally via
+// dbos.ReadStream).
 package duro
 
 import (

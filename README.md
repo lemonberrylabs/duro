@@ -131,6 +131,12 @@ DBOS_SYSTEM_DATABASE_URL=postgres://$USER@localhost:5432/quickstart go run .
 | `duro.Expand(name, fn)` | one item → many (`T → []R`), emitted in order | ✅ checkpointed step |
 | `duro.Reduce(name, fn, seed)` | fold the stream; emits the final accumulator | ✅ one step per accumulation |
 | `duro.FanOut(name, queue, wf)` | parallel map: each item runs as a child workflow on a DBOS queue | ✅ every child is a durable workflow |
+| `duro.Parallel(name, max, fn)` | parallel map: concurrent steps in-process, at most `max` at a time | ✅ pre-assigned step per item |
+| `duro.Delay(name, d)` | durable pause per item | ✅ recovery resumes the remaining time |
+| `duro.Send(name, topic, fn)` | message another workflow's mailbox per item | ✅ no re-send on replay |
+| `duro.Recv(name, topic, timeout)` | pause until an external message arrives; emits it | ✅ no double-consume on replay |
+| `duro.SetEvent(name, key, fn)` | publish per-item progress readable via `dbos.GetEvent` | ✅ checkpointed |
+| `duro.ToStream(name, key)` | append items to a durable stream readable via `dbos.ReadStream` | ✅ checkpointed; closed at completion |
 | `duro.Pure(name, fn)` | cheap reshaping between stages | ❌ re-executes on replay — must be deterministic and side-effect free |
 | `duro.UnsafeOperator(name, op)` | escape hatch for raw ro operators | ⚠️ you're on your own (runtime guards still apply) |
 
@@ -191,9 +197,39 @@ func ProcessAll(ctx dbos.DBOSContext, jobs []Job) (Merged, error) {
 Children are enqueued in stream order with IDs derived from the parent's step
 counter, so a recovered parent re-attaches to its children instead of spawning
 duplicates; results are awaited and emitted in input order, each checkpointed
-in the parent. This is the sanctioned form of concurrency inside a pipeline —
-determinism is preserved because DBOS checkpoints both the spawns and the
-awaits.
+in the parent. Determinism is preserved because DBOS checkpoints both the
+spawns and the awaits.
+
+When you don't need queue-level distribution or per-child durability,
+`duro.Parallel(name, max, fn)` is the lightweight sibling: concurrent **steps**
+inside the workflow process (built on `dbos.Go`, which pre-assigns each step's
+ID deterministically), bounded by `max`, with results in input order — no
+queue, no polling latency.
+
+### Signals, events, and streams
+
+The rest of DBOS's workflow toolkit is available as stages too:
+
+```go
+duro.Pipe5(
+	duro.Step("prepare", prepare),
+	duro.Delay[Prepared]("cool-off", 24*time.Hour),      // durable sleep — survives restarts
+	duro.Recv[Prepared, Approval]("await-approval", "approvals", 72*time.Hour),
+	duro.Step("execute", execute),                        // human-in-the-loop, durably
+	duro.ToStream[Receipt]("publish", "receipts"),        // readers consume incrementally
+)
+```
+
+- `Delay` checkpoints its wake-up deadline: a workflow recovered mid-sleep
+  sleeps only the remaining time; a replayed sleep is instant.
+- `Recv` parks the pipeline until a message arrives on the workflow's mailbox
+  (sent with `dbos.Send` from any workflow or plain client); receipt is
+  checkpointed so recovery never consumes a second message. `Send` is the
+  outbound counterpart.
+- `SetEvent` publishes per-item progress readable with `dbos.GetEvent` while
+  the pipeline runs; `ToStream` appends each item to a durable stream that
+  `dbos.ReadStream` consumers read incrementally, closed when the pipeline
+  completes.
 
 ## Built-in safety
 

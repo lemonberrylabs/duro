@@ -54,6 +54,15 @@ func TestMain(m *testing.M) {
 	dbos.RegisterWorkflow(ctx, fanChildSquare, dbos.WithWorkflowName("fanChildSquare"))
 	dbos.RegisterWorkflow(ctx, fanOutWorkflow, dbos.WithWorkflowName("fanOutWorkflow"))
 	dbos.RegisterWorkflow(ctx, fanOutAllWorkflow, dbos.WithWorkflowName("fanOutAllWorkflow"))
+	dbos.RegisterWorkflow(ctx, parallelWorkflow, dbos.WithWorkflowName("parallelWorkflow"))
+	dbos.RegisterWorkflow(ctx, parallelAllWorkflow, dbos.WithWorkflowName("parallelAllWorkflow"))
+	dbos.RegisterWorkflow(ctx, delayWorkflow, dbos.WithWorkflowName("delayWorkflow"))
+	dbos.RegisterWorkflow(ctx, recvGreetingWorkflow, dbos.WithWorkflowName("recvGreetingWorkflow"))
+	dbos.RegisterWorkflow(ctx, progressWorkflow, dbos.WithWorkflowName("progressWorkflow"))
+	dbos.RegisterWorkflow(ctx, streamingWorkflow, dbos.WithWorkflowName("streamingWorkflow"))
+	dbos.RegisterWorkflow(ctx, senderWorkflow, dbos.WithWorkflowName("senderWorkflow"))
+	dbos.RegisterWorkflow(ctx, pipe7Workflow, dbos.WithWorkflowName("pipe7Workflow"))
+	dbos.RegisterWorkflow(ctx, pipe8Workflow, dbos.WithWorkflowName("pipe8Workflow"))
 
 	if _, err := dbos.RegisterQueue(ctx, fanQueueName, dbos.WithGlobalConcurrency(fanQueueConcurrency)); err != nil {
 		fmt.Fprintf(os.Stderr, "registering queue: %v\n", err)
@@ -358,6 +367,154 @@ func resetFanCounters() {
 	fanChildMaxConcurrent.Store(0)
 }
 
+// --- parallel / signal / stream test workflows -------------------------------
+
+var (
+	parRuns          atomic.Int64
+	parActive        atomic.Int64
+	parMaxConcurrent atomic.Int64
+
+	delayPreRuns  atomic.Int64
+	delayPostRuns atomic.Int64
+)
+
+func trackedParSquare(_ context.Context, n int) (int, error) {
+	parRuns.Add(1)
+	active := parActive.Add(1)
+	defer parActive.Add(-1)
+	for {
+		seen := parMaxConcurrent.Load()
+		if active <= seen || parMaxConcurrent.CompareAndSwap(seen, active) {
+			break
+		}
+	}
+	time.Sleep(40 * time.Millisecond)
+	if n < 0 {
+		return 0, fmt.Errorf("cannot square a grumpy number: %d", n)
+	}
+	return n * n, nil
+}
+
+func parallelWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
+	return duro.Run(ctx, ns, duro.Pipe3(
+		duro.Expand("explode", func(_ context.Context, xs []int) ([]int, error) {
+			return xs, nil
+		}),
+		duro.Parallel("par", 4, trackedParSquare),
+		duro.Reduce("sum", func(_ context.Context, acc, v int) (int, error) {
+			return acc + v, nil
+		}, 0),
+	))
+}
+
+func parallelAllWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+	return duro.RunAll(ctx, ns, duro.Pipe2(
+		duro.Expand("explode", func(_ context.Context, xs []int) ([]int, error) {
+			return xs, nil
+		}),
+		duro.Parallel("par", 4, trackedParSquare),
+	))
+}
+
+const delayDuration = 2 * time.Second
+
+func delayWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
+	return duro.Run(ctx, n, duro.Pipe3(
+		duro.Step("pre", func(_ context.Context, v int) (int, error) {
+			delayPreRuns.Add(1)
+			return v + 1, nil
+		}),
+		duro.Delay[int]("pause", delayDuration),
+		duro.Step("post", func(_ context.Context, v int) (int, error) {
+			delayPostRuns.Add(1)
+			return v * 10, nil
+		}),
+	))
+}
+
+func recvGreetingWorkflow(ctx dbos.DBOSContext, _ string) (string, error) {
+	return duro.Run(ctx, "", duro.Pipe2(
+		duro.Recv[string, string]("await-note", "notes", 10*time.Second),
+		duro.Step("decorate", func(_ context.Context, note string) (string, error) {
+			return "received: " + note, nil
+		}),
+	))
+}
+
+func progressWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
+	return duro.Run(ctx, ns, duro.Pipe5(
+		duro.Expand("explode", func(_ context.Context, xs []int) ([]int, error) {
+			return xs, nil
+		}),
+		duro.Pure("as-is", func(v int) int { return v }),
+		duro.SetEvent("progress", "last-item", func(v int) int { return v }),
+		duro.Pure("still-as-is", func(v int) int { return v }),
+		duro.Reduce("sum", func(_ context.Context, acc, v int) (int, error) {
+			return acc + v, nil
+		}, 0),
+	))
+}
+
+// senderWorkflow notifies another workflow's mailbox through a duro.Send
+// stage, then returns its input decorated.
+func senderWorkflow(ctx dbos.DBOSContext, destinationID string) (string, error) {
+	return duro.Run(ctx, destinationID, duro.Pipe2(
+		duro.Send("notify", "notes", func(dest string) (string, string, error) {
+			return dest, "ping from " + dest, nil
+		}),
+		duro.Step("done", func(_ context.Context, dest string) (string, error) {
+			return "notified " + dest, nil
+		}),
+	))
+}
+
+// pipe7Workflow and pipe8Workflow are smoke coverage for the wide pipe
+// arities: linear int pipelines mixing durable and pure stages.
+func pipe7Workflow(ctx dbos.DBOSContext, n int) (int, error) {
+	inc := func(_ context.Context, v int) (int, error) { return v + 1, nil }
+	return duro.Run(ctx, n, duro.Pipe7(
+		duro.Step("s1", inc),
+		duro.Pure("p1", func(v int) int { return v }),
+		duro.Step("s2", inc),
+		duro.Tap("t1", func(_ context.Context, _ int) error { return nil }),
+		duro.Step("s3", inc),
+		duro.Pure("p2", func(v int) int { return v }),
+		duro.Step("s4", inc),
+	))
+}
+
+func pipe8Workflow(ctx dbos.DBOSContext, n int) (int, error) {
+	inc := func(_ context.Context, v int) (int, error) { return v + 1, nil }
+	return duro.Run(ctx, n, duro.Pipe8(
+		duro.Step("s1", inc),
+		duro.Pure("p1", func(v int) int { return v }),
+		duro.Step("s2", inc),
+		duro.Filter("keep-all", func(_ context.Context, _ int) (bool, error) { return true, nil }),
+		duro.Step("s3", inc),
+		duro.Pure("p2", func(v int) int { return v }),
+		duro.Step("s4", inc),
+		duro.Step("s5", inc),
+	))
+}
+
+func streamingWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
+	return duro.Run(ctx, ns, duro.Pipe3(
+		duro.Expand("explode", func(_ context.Context, xs []int) ([]int, error) {
+			return xs, nil
+		}),
+		duro.ToStream[int]("emit", "out"),
+		duro.Reduce("sum", func(_ context.Context, acc, v int) (int, error) {
+			return acc + v, nil
+		}, 0),
+	))
+}
+
+func resetParCounters() {
+	parRuns.Store(0)
+	parActive.Store(0)
+	parMaxConcurrent.Store(0)
+}
+
 // --- helpers ---------------------------------------------------------------
 
 func mustRun[P, R any](t *testing.T, wf dbos.Workflow[P, R], input P, opts ...dbos.WorkflowOption) (R, string) {
@@ -636,6 +793,27 @@ func TestConstructionPanics(t *testing.T) {
 	assertPanics(t, "nil pure function", func() {
 		duro.Pure[int, int]("reshape", nil)
 	})
+	assertPanics(t, "empty FanOut queue", func() {
+		duro.FanOut("fan", "", fanChildSquare)
+	})
+	assertPanics(t, "nil Parallel function", func() {
+		duro.Parallel[int, int]("par", 4, nil)
+	})
+	assertPanics(t, "empty Delay name", func() {
+		duro.Delay[int]("", time.Second)
+	})
+	assertPanics(t, "non-positive Delay duration", func() {
+		duro.Delay[int]("pause", 0)
+	})
+	assertPanics(t, "empty Recv name", func() {
+		duro.Recv[int, string]("", "topic", time.Second)
+	})
+	assertPanics(t, "empty SetEvent key", func() {
+		duro.SetEvent("progress", "", func(v int) int { return v })
+	})
+	assertPanics(t, "empty ToStream key", func() {
+		duro.ToStream[int]("emit", "")
+	})
 }
 
 func assertPanics(t *testing.T, name string, fn func()) {
@@ -756,6 +934,223 @@ func TestFanOutChildFailure(t *testing.T) {
 	_, err = handle.GetResult()
 	if err == nil || !strings.Contains(err.Error(), `stage "fan"`) || !strings.Contains(err.Error(), "grumpy") {
 		t.Fatalf("workflow error = %v, want the fan stage's child failure", err)
+	}
+}
+
+// TestParallelBoundedMapReduce proves in-process bounded parallelism: 20
+// items squared by concurrent DBOS steps (dbos.Go under the hood), at most 4
+// at a time, merged by a durable Reduce.
+func TestParallelBoundedMapReduce(t *testing.T) {
+	resetParCounters()
+
+	jobs := make([]int, 20)
+	wantSum := 0
+	for i := range jobs {
+		jobs[i] = i + 1
+		wantSum += (i + 1) * (i + 1)
+	}
+
+	result, _ := mustRun(t, parallelWorkflow, jobs)
+	if result != wantSum {
+		t.Errorf("result = %d, want %d", result, wantSum)
+	}
+	if got := parRuns.Load(); got != 20 {
+		t.Errorf("step executions = %d, want 20", got)
+	}
+	maxSeen := parMaxConcurrent.Load()
+	if maxSeen > 4 {
+		t.Errorf("max concurrent steps = %d, must not exceed 4", maxSeen)
+	}
+	if maxSeen < 2 {
+		t.Errorf("max concurrent steps = %d, want ≥ 2 (no parallelism happened)", maxSeen)
+	}
+}
+
+// TestParallelPreservesOrder proves results are emitted in input order and
+// that each item occupies one pre-assigned step slot, in stream order.
+func TestParallelPreservesOrder(t *testing.T) {
+	resetParCounters()
+
+	result, wfID := mustRun(t, parallelAllWorkflow, []int{3, 1, 2})
+	want := []int{9, 1, 4}
+	if len(result) != len(want) {
+		t.Fatalf("result = %v, want %v", result, want)
+	}
+	for i := range want {
+		if result[i] != want[i] {
+			t.Fatalf("result = %v, want %v (input order must be preserved)", result, want)
+		}
+	}
+	assertNames(t, stepNames(t, wfID), []string{
+		duro.ShapeStepName, "explode", "par", "par", "par",
+	})
+}
+
+// TestParallelDurabilityRerun proves a completed parallel workflow replays
+// with zero step re-executions.
+func TestParallelDurabilityRerun(t *testing.T) {
+	resetParCounters()
+	const wfID = "parallel-durability-rerun"
+
+	first, _ := mustRun(t, parallelWorkflow, []int{1, 2, 3, 4, 5}, dbos.WithWorkflowID(wfID))
+	runsAfterFirst := parRuns.Load()
+
+	second, _ := mustRun(t, parallelWorkflow, []int{1, 2, 3, 4, 5}, dbos.WithWorkflowID(wfID))
+	if first != second {
+		t.Errorf("rerun result = %d, want recorded result %d", second, first)
+	}
+	if got := parRuns.Load(); got != runsAfterFirst {
+		t.Errorf("step executions changed on rerun: %d → %d", runsAfterFirst, got)
+	}
+}
+
+func TestParallelStepFailure(t *testing.T) {
+	resetParCounters()
+
+	handle, err := dbos.RunWorkflow(dctx, parallelWorkflow, []int{1, -2, 3})
+	if err != nil {
+		t.Fatalf("starting workflow: %v", err)
+	}
+	_, err = handle.GetResult()
+	if err == nil || !strings.Contains(err.Error(), `stage "par"`) || !strings.Contains(err.Error(), "grumpy") {
+		t.Fatalf("workflow error = %v, want the par stage's step failure", err)
+	}
+}
+
+// TestDelayDurableSleep proves Delay really pauses, and — via a fork replay
+// past the sleep's step slot — that a recovered workflow does not sleep again.
+func TestDelayDurableSleep(t *testing.T) {
+	delayPreRuns.Store(0)
+	delayPostRuns.Store(0)
+
+	start := time.Now()
+	result, wfID := mustRun(t, delayWorkflow, 4)
+	elapsed := time.Since(start)
+	if result != 50 {
+		t.Errorf("result = %d, want 50", result)
+	}
+	if elapsed < delayDuration {
+		t.Errorf("first run took %v, want ≥ %v (Delay did not pause)", elapsed, delayDuration)
+	}
+
+	// Fork past the sleep slot (0 shape, 1 pre, 2 sleep, 3 post): the sleep
+	// replays from its checkpoint, so the fork must complete far faster than
+	// the sleep duration while re-executing only the post step.
+	start = time.Now()
+	handle, err := dbos.ForkWorkflow[int](dctx, dbos.ForkWorkflowInput{
+		OriginalWorkflowID: wfID,
+		StartStep:          3,
+	})
+	if err != nil {
+		t.Fatalf("forking workflow: %v", err)
+	}
+	forked, err := handle.GetResult()
+	if err != nil {
+		t.Fatalf("forked workflow failed: %v", err)
+	}
+	forkElapsed := time.Since(start)
+	if forked != result {
+		t.Errorf("forked result = %d, want %d", forked, result)
+	}
+	if forkElapsed >= delayDuration {
+		t.Errorf("fork replay took %v, want < %v (sleep re-executed instead of replayed)", forkElapsed, delayDuration)
+	}
+	if pre, post := delayPreRuns.Load(), delayPostRuns.Load(); pre != 1 || post != 2 {
+		t.Errorf("pre/post executions = %d/%d, want 1/2 (fork replays pre and sleep, re-executes post)", pre, post)
+	}
+}
+
+// TestSendRecvBridge proves a pipeline can durably pause for an external
+// signal: the workflow blocks in Recv until a message is sent to its mailbox.
+func TestSendRecvBridge(t *testing.T) {
+	const wfID = "recv-greeting"
+
+	handle, err := dbos.RunWorkflow(dctx, recvGreetingWorkflow, "", dbos.WithWorkflowID(wfID))
+	if err != nil {
+		t.Fatalf("starting workflow: %v", err)
+	}
+	if err := dbos.Send(dctx, wfID, "hello duro", "notes"); err != nil {
+		t.Fatalf("sending message: %v", err)
+	}
+	result, err := handle.GetResult()
+	if err != nil {
+		t.Fatalf("workflow failed: %v", err)
+	}
+	if result != "received: hello duro" {
+		t.Errorf("result = %q, want %q", result, "received: hello duro")
+	}
+}
+
+// TestSendStageBridgesWorkflows is the workflow-to-workflow variant: a
+// duro.Send stage in one pipeline unblocks a duro.Recv stage in another.
+func TestSendStageBridgesWorkflows(t *testing.T) {
+	const receiverID = "recv-greeting-from-stage"
+
+	receiver, err := dbos.RunWorkflow(dctx, recvGreetingWorkflow, "", dbos.WithWorkflowID(receiverID))
+	if err != nil {
+		t.Fatalf("starting receiver: %v", err)
+	}
+	senderResult, _ := mustRun(t, senderWorkflow, receiverID)
+	if senderResult != "notified "+receiverID {
+		t.Errorf("sender result = %q", senderResult)
+	}
+	received, err := receiver.GetResult()
+	if err != nil {
+		t.Fatalf("receiver failed: %v", err)
+	}
+	if received != "received: ping from "+receiverID {
+		t.Errorf("receiver result = %q", received)
+	}
+}
+
+// TestWidePipes is smoke coverage for the Pipe7/Pipe8 arities.
+func TestWidePipes(t *testing.T) {
+	if got, _ := mustRun(t, pipe7Workflow, 0); got != 4 {
+		t.Errorf("pipe7 result = %d, want 4", got)
+	}
+	if got, _ := mustRun(t, pipe8Workflow, 0); got != 5 {
+		t.Errorf("pipe8 result = %d, want 5", got)
+	}
+}
+
+// TestSetEventExposesProgress proves SetEvent publishes per-item progress
+// readable from outside the workflow via dbos.GetEvent.
+func TestSetEventExposesProgress(t *testing.T) {
+	result, wfID := mustRun(t, progressWorkflow, []int{1, 2, 3})
+	if result != 6 {
+		t.Errorf("result = %d, want 6", result)
+	}
+	last, err := dbos.GetEvent[int](dctx, wfID, "last-item", 5*time.Second)
+	if err != nil {
+		t.Fatalf("reading event: %v", err)
+	}
+	if last != 3 {
+		t.Errorf("last-item event = %d, want 3 (the final item)", last)
+	}
+}
+
+// TestToStreamPublishesItems proves ToStream writes every item to a durable
+// stream, closed at pipeline completion, readable via dbos.ReadStream.
+func TestToStreamPublishesItems(t *testing.T) {
+	result, wfID := mustRun(t, streamingWorkflow, []int{1, 2, 3})
+	if result != 6 {
+		t.Errorf("result = %d, want 6", result)
+	}
+	values, closed, err := dbos.ReadStream[int](dctx, wfID, "out")
+	if err != nil {
+		t.Fatalf("reading stream: %v", err)
+	}
+	if !closed {
+		t.Errorf("stream not closed after pipeline completion")
+	}
+	want := []int{1, 2, 3}
+	if len(values) != len(want) {
+		t.Fatalf("stream values = %v, want %v", values, want)
+	}
+	for i := range want {
+		if values[i] != want[i] {
+			t.Fatalf("stream values = %v, want %v", values, want)
+		}
 	}
 }
 
