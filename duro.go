@@ -5,7 +5,7 @@
 //
 // A workflow body is a pipe of typed stages:
 //
-//	func OrderWorkflow(ctx dbos.DBOSContext, o Order) (Confirmation, error) {
+//	func OrderWorkflow(ctx duro.Context, o Order) (Confirmation, error) {
 //		return duro.Run(ctx, o, duro.Pipe4(
 //			duro.Step("validate", validateOrder),
 //			duro.Step("reserve", reserveInventory),
@@ -45,9 +45,16 @@
 //
 // The rest of DBOS's workflow toolkit is available as stages: Delay (durable
 // sleep), Send/Recv (durable mailbox messaging — external signals and
-// human-in-the-loop pauses), SetEvent (progress events readable via
-// dbos.GetEvent), and ToStream (durable streams readable incrementally via
-// dbos.ReadStream).
+// human-in-the-loop pauses), SetEvent/GetEvent (progress events published and
+// read durably), and ToStream/FromStream (durable streams written and drained
+// durably). Messaging stages take Portable() to serialize payloads in DBOS's
+// cross-language format.
+//
+// Pipelines are also registrable as first-class workflows: Register names a
+// pipeline as a DBOS workflow, RegisterScheduled runs one on a cron schedule
+// (typed Pipeline[time.Time, R]), and RegisterDebounced collapses bursts of
+// triggers into a single run. ForkFromStage restarts a completed or failed
+// run from a named stage — optionally onto a different application version.
 package duro
 
 import (
@@ -60,6 +67,20 @@ import (
 	"github.com/dbos-inc/dbos-transact-golang/dbos"
 	"github.com/samber/ro"
 )
+
+// Context is the durable execution context every workflow runs under: it
+// carries the checkpoint state duro's stages record to. It is DBOS's context
+// type under a duro name (a type alias), so it satisfies context.Context and
+// remains directly usable with any dbos API — but declaring and running
+// workflows never requires importing dbos:
+//
+//	func Process(ctx duro.Context, job Job) (Result, error)
+type Context = dbos.DBOSContext
+
+// WorkflowFunc is a hand-written durable workflow function, the kind
+// dbos.RegisterWorkflow registers and Workflow adapts into a FanOut child.
+// Registered pipelines (Register) never touch this type.
+type WorkflowFunc[P, R any] = dbos.Workflow[P, R]
 
 // ErrNoValue is returned by Run when the pipeline completes without emitting
 // any value (for example, when a Filter stage drops every item).
@@ -75,9 +96,10 @@ var ErrAborted = errors.New("duro: pipeline aborted by an earlier stage failure"
 // package's constructors can build them, which is what keeps arbitrary ro
 // operators out of durable pipelines at compile time.
 type Stage[T, R any] struct {
-	name  string
-	kind  string
-	apply func(ro.Observable[T]) ro.Observable[R]
+	name   string
+	kind   string
+	apply  func(ro.Observable[T]) ro.Observable[R]
+	queues []Queue // queues this stage enqueues onto (FanOut); Register auto-registers them
 }
 
 func (s Stage[T, R]) info() stageInfo { return stageInfo{kind: s.kind, name: s.name} }
@@ -87,21 +109,59 @@ type StepOption func(*stepConfig)
 
 type stepConfig struct {
 	dbosOpts []dbos.StepOption
+	timeout  time.Duration
+}
+
+// stepOption lifts a DBOS step option into a duro StepOption.
+func stepOption(o dbos.StepOption) StepOption {
+	return func(c *stepConfig) { c.dbosOpts = append(c.dbosOpts, o) }
+}
+
+// newStepConfig resolves a stage's step options, naming the DBOS step after
+// the stage. It is called per step execution, not at stage construction:
+// dbos.RunAsStep appends to the option slice it receives, so a shared,
+// pre-resolved slice would race between concurrent runs of the same pipeline.
+func newStepConfig(name string, opts []StepOption) stepConfig {
+	cfg := stepConfig{dbosOpts: []dbos.StepOption{dbos.WithStepName(name)}}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return cfg
 }
 
 // WithMaxRetries sets the maximum number of automatic retries for the stage
 // when its function returns an error. Zero (the default) means no retries.
-func WithMaxRetries(n int) StepOption {
-	return func(c *stepConfig) {
-		c.dbosOpts = append(c.dbosOpts, dbos.WithStepMaxRetries(n))
-	}
-}
+// This is the step-level retry limit (DBOS's WithStepMaxRetries), distinct
+// from workflow recovery attempts, which are configured at registration.
+func WithMaxRetries(n int) StepOption { return stepOption(dbos.WithStepMaxRetries(n)) }
 
 // WithBaseInterval sets the initial delay between retries (default 100ms).
-func WithBaseInterval(d time.Duration) StepOption {
-	return func(c *stepConfig) {
-		c.dbosOpts = append(c.dbosOpts, dbos.WithBaseInterval(d))
-	}
+func WithBaseInterval(d time.Duration) StepOption { return stepOption(dbos.WithBaseInterval(d)) }
+
+// WithMaxInterval caps the delay between retries (default 5s).
+func WithMaxInterval(d time.Duration) StepOption { return stepOption(dbos.WithMaxInterval(d)) }
+
+// WithBackoffFactor sets the exponential multiplier applied to the retry
+// delay after each attempt (default 2.0).
+func WithBackoffFactor(factor float64) StepOption { return stepOption(dbos.WithBackoffFactor(factor)) }
+
+// WithRetryPredicate restricts which errors are retried: when the stage
+// function returns an error for which pred is false, the stage stops
+// immediately with that error even if retries remain. Use it to spend
+// retries on transient failures only.
+func WithRetryPredicate(pred func(error) bool) StepOption {
+	return stepOption(dbos.WithRetryPredicate(pred))
+}
+
+// WithTimeout bounds each execution attempt of the stage function: the step
+// context is cancelled after d and the attempt fails with the context's
+// error. Retries get a fresh deadline. DBOS has no native step timeout, so
+// the deadline is enforced in-process per attempt — the stage function must
+// honor context cancellation for the timeout to take effect. For a durable
+// deadline on a whole pipeline, start its workflow from a context derived
+// with dbos.WithTimeout; for child workflows, see WithChildTimeout.
+func WithTimeout(d time.Duration) StepOption {
+	return func(c *stepConfig) { c.timeout = d }
 }
 
 func mustValidStage(kind, name string, fnIsNil bool) {
@@ -224,93 +284,6 @@ func UnsafeOperator[T, R any](name string, op func(ro.Observable[T]) ro.Observab
 	return Stage[T, R]{name: name, kind: "unsafe", apply: op}
 }
 
-// FanOut is a durable parallel map: each item starts wf as a child workflow
-// on the named DBOS queue, and once the stream completes, results are awaited
-// and emitted downstream in input order. Parallelism, rate limits, and
-// distribution across processes are governed entirely by the queue's
-// configuration — e.g. a queue registered with dbos.WithGlobalConcurrency(4)
-// runs at most four children at a time across all executors:
-//
-//	dbos.RegisterQueue(ctx, "jobs", dbos.WithGlobalConcurrency(4))
-//	...
-//	duro.Pipe3(
-//		duro.Expand("explode", split),
-//		duro.FanOut("process", "jobs", ProcessJob), // ProcessJob: a registered dbos.Workflow
-//		duro.Reduce("merge", merge, seed),
-//	)
-//
-// FanOut is the sanctioned form of concurrency inside a duro pipeline: it is
-// deterministic because children are enqueued in stream order (child workflow
-// IDs derive from the parent's step counter, so a recovered parent re-attaches
-// to its children instead of spawning duplicates) and awaited in that same
-// order (each result is checkpointed in the parent). Every child is itself a
-// durable workflow.
-//
-// On the first child failure, FanOut fails the pipeline with that child's
-// error. Children queued behind it are independent durable workflows and run
-// to completion in the background; cancel them with dbos.CancelWorkflows if
-// that is not what you want.
-func FanOut[T, R any](name string, queueName string, wf dbos.Workflow[T, R]) Stage[T, R] {
-	mustValidStage("FanOut", name, wf == nil)
-	if queueName == "" {
-		panic(fmt.Sprintf("duro: FanOut stage %q requires a queue name", name))
-	}
-	return Stage[T, R]{name: name, kind: "fanout", apply: func(source ro.Observable[T]) ro.Observable[R] {
-		return ro.NewUnsafeObservableWithContext(func(subCtx context.Context, dest ro.Observer[R]) ro.Teardown {
-			var handles []dbos.WorkflowHandle[R]
-			failed := false
-
-			fail := func(ctx context.Context, err error) {
-				failed = true
-				dest.ErrorWithContext(ctx, err)
-			}
-
-			sub := source.SubscribeWithContext(subCtx, ro.NewObserverWithContext(
-				func(ctx context.Context, in T) {
-					if failed {
-						return
-					}
-					state, err := stageState(ctx, name)
-					if err != nil {
-						fail(ctx, err)
-						return
-					}
-					handle, err := dbos.RunWorkflow(state.dctx, wf, in, dbos.WithQueue(queueName))
-					if err != nil {
-						state.aborted.Store(true)
-						fail(ctx, fmt.Errorf("duro: stage %q: enqueueing child workflow: %w", name, err))
-						return
-					}
-					handles = append(handles, handle)
-				},
-				dest.ErrorWithContext,
-				func(ctx context.Context) {
-					if failed {
-						return
-					}
-					for _, handle := range handles {
-						state, err := stageState(ctx, name)
-						if err != nil {
-							fail(ctx, err)
-							return
-						}
-						result, err := handle.GetResult()
-						if err != nil {
-							state.aborted.Store(true)
-							fail(ctx, fmt.Errorf("duro: stage %q: child workflow %s: %w", name, handle.GetWorkflowID(), err))
-							return
-						}
-						dest.NextWithContext(ctx, result)
-					}
-					dest.CompleteWithContext(ctx)
-				},
-			))
-
-			return sub.Unsubscribe
-		})
-	}}
-}
-
 // pipelineState carries the workflow's DBOSContext, the subscribing
 // goroutine, and a shared abort flag through the observable chain.
 type pipelineState struct {
@@ -351,16 +324,23 @@ func runStep[T, R any](ctx context.Context, name string, in T, fn func(context.C
 		return zero, err
 	}
 
-	cfg := stepConfig{dbosOpts: []dbos.StepOption{dbos.WithStepName(name)}}
-	for _, opt := range opts {
-		opt(&cfg)
-	}
-
-	out, err := dbos.RunAsStep(state.dctx, func(stepCtx context.Context) (R, error) {
-		return fn(stepCtx, in)
-	}, cfg.dbosOpts...)
+	cfg := newStepConfig(name, opts)
+	out, err := dbos.RunAsStep(state.dctx, stepBody(cfg, in, fn), cfg.dbosOpts...)
 	if err != nil {
 		state.aborted.Store(true)
 	}
 	return out, err
+}
+
+// stepBody adapts fn(in) to a DBOS step body, enforcing the configured
+// per-attempt timeout.
+func stepBody[T, R any](cfg stepConfig, in T, fn func(context.Context, T) (R, error)) func(context.Context) (R, error) {
+	return func(stepCtx context.Context) (R, error) {
+		if cfg.timeout > 0 {
+			var cancel context.CancelFunc
+			stepCtx, cancel = context.WithTimeout(stepCtx, cfg.timeout)
+			defer cancel()
+		}
+		return fn(stepCtx, in)
+	}
 }

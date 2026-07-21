@@ -22,8 +22,15 @@ import (
 // The tests run against a real local Postgres so that checkpointing, replay,
 // and forking exercise the same machinery as production DBOS. The dbos schema
 // in the test database is dropped before each `go test` run.
+//
+// The suite runs on a duro.App (dogfooding New/Launch/Shutdown). app is used
+// for duro APIs; dctx is the raw DBOS context for direct dbos.* calls, which
+// may inspect the concrete context type.
 
-var dctx dbos.DBOSContext
+var (
+	app  *duro.App
+	dctx dbos.DBOSContext
+)
 
 func TestMain(m *testing.M) {
 	url := testDatabaseURL()
@@ -32,8 +39,9 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	ctx, err := dbos.NewDBOSContext(context.Background(), dbos.Config{
-		AppName:     "duro-test",
+	var err error
+	app, err = duro.New(context.Background(), duro.Config{
+		Name:        "duro-test",
 		DatabaseURL: url,
 		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})),
 	})
@@ -41,6 +49,7 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "initializing DBOS: %v\n", err)
 		os.Exit(1)
 	}
+	ctx := app.Context()
 
 	dbos.RegisterWorkflow(ctx, linearWorkflow, dbos.WithWorkflowName("linearWorkflow"))
 	dbos.RegisterWorkflow(ctx, plainLinearWorkflow, dbos.WithWorkflowName("plainLinearWorkflow"))
@@ -64,19 +73,30 @@ func TestMain(m *testing.M) {
 	dbos.RegisterWorkflow(ctx, pipe7Workflow, dbos.WithWorkflowName("pipe7Workflow"))
 	dbos.RegisterWorkflow(ctx, pipe8Workflow, dbos.WithWorkflowName("pipe8Workflow"))
 
-	if _, err := dbos.RegisterQueue(ctx, fanQueueName, dbos.WithGlobalConcurrency(fanQueueConcurrency)); err != nil {
+	// The registerX helpers call raw dbos.RegisterWorkflow, which inspects the
+	// concrete context type — hand them the inner context, not the App.
+	registerOptionWorkflows(ctx)
+	registerReadSideWorkflows(ctx)
+	registerPipelineWorkflows(app)
+	if err := registerFanOutOptionWorkflows(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "registering fan-out option workflows: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := duro.RegisterQueues(app, fanQueue); err != nil {
 		fmt.Fprintf(os.Stderr, "registering queue: %v\n", err)
 		os.Exit(1)
 	}
 
-	if err := dbos.Launch(ctx); err != nil {
+	if err := app.Launch(); err != nil {
 		fmt.Fprintf(os.Stderr, "launching DBOS: %v\n", err)
 		os.Exit(1)
 	}
+	appVersion.Store(ctx.GetApplicationVersion())
 	dctx = ctx
 
 	code := m.Run()
-	dbos.Shutdown(ctx, 10*time.Second)
+	app.Shutdown(10 * time.Second)
 	os.Exit(code)
 }
 
@@ -314,6 +334,16 @@ const (
 	fanQueueConcurrency = 4
 )
 
+// Shared declarations: the queue and channels referenced by test pipelines.
+// Declared once, referenced by value everywhere — the duro way.
+var (
+	fanQueue = duro.NewQueue(fanQueueName, duro.WithConcurrency(fanQueueConcurrency))
+
+	notesTopic    = duro.NewTopic[string]("notes")
+	lastItemEvent = duro.NewEvent[int]("last-item")
+	outStream     = duro.NewStream[int]("out")
+)
+
 var (
 	fanChildRuns          atomic.Int64
 	fanChildActive        atomic.Int64
@@ -345,7 +375,7 @@ func fanOutWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
 		duro.Expand("explode", func(_ context.Context, xs []int) ([]int, error) {
 			return xs, nil
 		}),
-		duro.FanOut("fan", fanQueueName, fanChildSquare),
+		duro.FanOut("fan", fanQueue, duro.Workflow(fanChildSquare)),
 		duro.Reduce("sum", func(_ context.Context, acc, v int) (int, error) {
 			return acc + v, nil
 		}, 0),
@@ -357,7 +387,7 @@ func fanOutAllWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
 		duro.Expand("explode", func(_ context.Context, xs []int) ([]int, error) {
 			return xs, nil
 		}),
-		duro.FanOut("fan", fanQueueName, fanChildSquare),
+		duro.FanOut("fan", fanQueue, duro.Workflow(fanChildSquare)),
 	))
 }
 
@@ -434,7 +464,7 @@ func delayWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
 
 func recvGreetingWorkflow(ctx dbos.DBOSContext, _ string) (string, error) {
 	return duro.Run(ctx, "", duro.Pipe2(
-		duro.Recv[string, string]("await-note", "notes", 10*time.Second),
+		duro.Recv[string]("await-note", notesTopic, 10*time.Second),
 		duro.Step("decorate", func(_ context.Context, note string) (string, error) {
 			return "received: " + note, nil
 		}),
@@ -447,7 +477,7 @@ func progressWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
 			return xs, nil
 		}),
 		duro.Pure("as-is", func(v int) int { return v }),
-		duro.SetEvent("progress", "last-item", func(v int) int { return v }),
+		duro.SetEvent("progress", lastItemEvent, func(v int) int { return v }),
 		duro.Pure("still-as-is", func(v int) int { return v }),
 		duro.Reduce("sum", func(_ context.Context, acc, v int) (int, error) {
 			return acc + v, nil
@@ -459,7 +489,7 @@ func progressWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
 // stage, then returns its input decorated.
 func senderWorkflow(ctx dbos.DBOSContext, destinationID string) (string, error) {
 	return duro.Run(ctx, destinationID, duro.Pipe2(
-		duro.Send("notify", "notes", func(dest string) (string, string, error) {
+		duro.Send("notify", notesTopic, func(dest string) (string, string, error) {
 			return dest, "ping from " + dest, nil
 		}),
 		duro.Step("done", func(_ context.Context, dest string) (string, error) {
@@ -502,7 +532,7 @@ func streamingWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
 		duro.Expand("explode", func(_ context.Context, xs []int) ([]int, error) {
 			return xs, nil
 		}),
-		duro.ToStream[int]("emit", "out"),
+		duro.ToStream("emit", outStream),
 		duro.Reduce("sum", func(_ context.Context, acc, v int) (int, error) {
 			return acc + v, nil
 		}, 0),
@@ -793,8 +823,8 @@ func TestConstructionPanics(t *testing.T) {
 	assertPanics(t, "nil pure function", func() {
 		duro.Pure[int, int]("reshape", nil)
 	})
-	assertPanics(t, "empty FanOut queue", func() {
-		duro.FanOut("fan", "", fanChildSquare)
+	assertPanics(t, "zero-value FanOut queue", func() {
+		duro.FanOut("fan", duro.Queue{}, duro.Workflow(fanChildSquare))
 	})
 	assertPanics(t, "nil Parallel function", func() {
 		duro.Parallel[int, int]("par", 4, nil)
@@ -806,13 +836,19 @@ func TestConstructionPanics(t *testing.T) {
 		duro.Delay[int]("pause", 0)
 	})
 	assertPanics(t, "empty Recv name", func() {
-		duro.Recv[int, string]("", "topic", time.Second)
+		duro.Recv[int]("", notesTopic, time.Second)
 	})
-	assertPanics(t, "empty SetEvent key", func() {
-		duro.SetEvent("progress", "", func(v int) int { return v })
+	assertPanics(t, "zero-value SetEvent event", func() {
+		duro.SetEvent("progress", duro.Event[int]{}, func(v int) int { return v })
 	})
-	assertPanics(t, "empty ToStream key", func() {
-		duro.ToStream[int]("emit", "")
+	assertPanics(t, "zero-value ToStream stream", func() {
+		duro.ToStream("emit", duro.Stream[int]{})
+	})
+	assertPanics(t, "empty queue name", func() {
+		duro.NewQueue("")
+	})
+	assertPanics(t, "empty topic name", func() {
+		duro.NewTopic[string]("")
 	})
 }
 
@@ -1114,13 +1150,13 @@ func TestWidePipes(t *testing.T) {
 }
 
 // TestSetEventExposesProgress proves SetEvent publishes per-item progress
-// readable from outside the workflow via dbos.GetEvent.
+// readable from outside the workflow via the event channel's Get.
 func TestSetEventExposesProgress(t *testing.T) {
 	result, wfID := mustRun(t, progressWorkflow, []int{1, 2, 3})
 	if result != 6 {
 		t.Errorf("result = %d, want 6", result)
 	}
-	last, err := dbos.GetEvent[int](dctx, wfID, "last-item", 5*time.Second)
+	last, err := lastItemEvent.Get(app, wfID, 5*time.Second)
 	if err != nil {
 		t.Fatalf("reading event: %v", err)
 	}
@@ -1130,13 +1166,14 @@ func TestSetEventExposesProgress(t *testing.T) {
 }
 
 // TestToStreamPublishesItems proves ToStream writes every item to a durable
-// stream, closed at pipeline completion, readable via dbos.ReadStream.
+// stream, closed at pipeline completion, readable via the stream channel's
+// Read.
 func TestToStreamPublishesItems(t *testing.T) {
 	result, wfID := mustRun(t, streamingWorkflow, []int{1, 2, 3})
 	if result != 6 {
 		t.Errorf("result = %d, want 6", result)
 	}
-	values, closed, err := dbos.ReadStream[int](dctx, wfID, "out")
+	values, closed, err := outStream.Read(app, wfID)
 	if err != nil {
 		t.Fatalf("reading stream: %v", err)
 	}

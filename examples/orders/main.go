@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/dbos-inc/dbos-transact-golang/dbos"
+
+	"github.com/lemonberrylabs/duro"
 )
 
 const (
@@ -23,28 +25,29 @@ func main() {
 	flag.Parse()
 	crashAfterStep = *crashAfter
 
-	dctx, err := dbos.NewDBOSContext(context.Background(), dbos.Config{
-		AppName:     "duro-orders",
+	app, err := duro.New(context.Background(), duro.Config{
+		Name:        "duro-orders",
 		DatabaseURL: databaseURL(),
 		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
 	})
 	if err != nil {
 		fatal("initializing DBOS: %v", err)
 	}
+	dctx := app.Context()
 
 	dbos.RegisterWorkflow(dctx, OrderWorkflow, dbos.WithWorkflowName("OrderWorkflow"))
 	dbos.RegisterWorkflow(dctx, OrderWorkflowRo, dbos.WithWorkflowName("OrderWorkflowRo"))
 	dbos.RegisterWorkflow(dctx, BatchInvoiceWorkflow, dbos.WithWorkflowName("BatchInvoiceWorkflow"))
 	dbos.RegisterWorkflow(dctx, BatchInvoiceFanOutWorkflow, dbos.WithWorkflowName("BatchInvoiceFanOutWorkflow"))
 	dbos.RegisterWorkflow(dctx, PriceItemWorkflow, dbos.WithWorkflowName("PriceItemWorkflow"))
-	if _, err := dbos.RegisterQueue(dctx, pricingQueueName, dbos.WithGlobalConcurrency(2)); err != nil {
+	if err := duro.RegisterQueues(app, pricingQueue); err != nil {
 		fatal("registering pricing queue: %v", err)
 	}
 
-	if err := dbos.Launch(dctx); err != nil {
+	if err := app.Launch(); err != nil {
 		fatal("launching DBOS: %v", err)
 	}
-	defer dbos.Shutdown(dctx, 5*time.Second)
+	defer app.Shutdown(5 * time.Second)
 
 	// A crashed demo from a previous run is recovered automatically at Launch;
 	// report it before running anything new.

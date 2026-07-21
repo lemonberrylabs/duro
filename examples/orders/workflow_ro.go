@@ -3,8 +3,6 @@ package main
 import (
 	"context"
 
-	"github.com/dbos-inc/dbos-transact-golang/dbos"
-
 	"github.com/lemonberrylabs/duro"
 )
 
@@ -23,7 +21,7 @@ func crashProbe[T any](point string) duro.Stage[T, T] {
 // functions composed as a durable pipeline. Each duro.Step runs inside
 // dbos.RunAsStep, so checkpointing and recovery behave exactly like the plain
 // variant.
-func OrderWorkflowRo(ctx dbos.DBOSContext, o Order) (Confirmation, error) {
+func OrderWorkflowRo(ctx duro.Context, o Order) (Confirmation, error) {
 	return duro.Run(ctx, o, duro.Pipe6(
 		duro.Step("validate", validateOrder),
 		duro.Step("reserve", reserveInventory),
@@ -37,7 +35,7 @@ func OrderWorkflowRo(ctx dbos.DBOSContext, o Order) (Confirmation, error) {
 // BatchInvoiceWorkflow shows a more complex durable pipeline built from
 // duro primitives: one Batch is exploded into line items, filtered, priced,
 // audited, and folded into an Invoice — every stage a checkpointed DBOS step.
-func BatchInvoiceWorkflow(ctx dbos.DBOSContext, b Batch) (Invoice, error) {
+func BatchInvoiceWorkflow(ctx duro.Context, b Batch) (Invoice, error) {
 	return duro.Run(ctx, b, duro.Pipe5(
 		duro.Expand("explode-batch", func(_ context.Context, b Batch) ([]LineItem, error) {
 			stepLog("exploding batch %s into %d line items", b.ID, len(b.Items))

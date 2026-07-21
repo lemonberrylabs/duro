@@ -56,13 +56,8 @@ func Parallel[T, R any](name string, maxConcurrent int, fn func(ctx context.Cont
 					if sem != nil {
 						sem <- struct{}{} // backpressure: wait for a slot, on the workflow goroutine
 					}
-					cfg := stepConfig{dbosOpts: []dbos.StepOption{dbos.WithStepName(name)}}
-					for _, opt := range opts {
-						opt(&cfg)
-					}
-					outcome, err := dbos.Go(state.dctx, func(stepCtx context.Context) (R, error) {
-						return fn(stepCtx, in)
-					}, cfg.dbosOpts...)
+					cfg := newStepConfig(name, opts)
+					outcome, err := dbos.Go(state.dctx, stepBody(cfg, in, fn), cfg.dbosOpts...)
 					if err != nil {
 						if sem != nil {
 							<-sem

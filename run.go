@@ -21,7 +21,7 @@ const ShapeStepName = "duro.shape"
 // input value and blocking until completion. It returns the last emitted
 // value, the first stage error, or ErrNoValue if the pipeline emits nothing.
 // Call it as the body of a registered DBOS workflow function.
-func Run[P, R any](ctx dbos.DBOSContext, in P, p Pipeline[P, R]) (R, error) {
+func Run[P, R any](ctx Context, in P, p Pipeline[P, R]) (R, error) {
 	var zero R
 	values, err := RunAll(ctx, in, p)
 	if err != nil {
@@ -35,7 +35,8 @@ func Run[P, R any](ctx dbos.DBOSContext, in P, p Pipeline[P, R]) (R, error) {
 
 // RunAll is Run for pipelines whose final stage legitimately emits multiple
 // items: it returns every emitted value.
-func RunAll[P, R any](ctx dbos.DBOSContext, in P, p Pipeline[P, R]) ([]R, error) {
+func RunAll[P, R any](ctx Context, in P, p Pipeline[P, R]) ([]R, error) {
+	ctx = unwrapContext(ctx)
 	if err := verifyShape(ctx, p.fingerprint()); err != nil {
 		return nil, err
 	}
@@ -52,7 +53,7 @@ func RunAll[P, R any](ctx dbos.DBOSContext, in P, p Pipeline[P, R]) ([]R, error)
 // fingerprint, and a mismatch means the workflow constructed a different
 // pipeline than the original run — failing here prevents stages from reading
 // checkpoints that belong to other stages.
-func verifyShape(ctx dbos.DBOSContext, fingerprint string) error {
+func verifyShape(ctx Context, fingerprint string) error {
 	recorded, err := dbos.RunAsStep(ctx, func(context.Context) (string, error) {
 		return fingerprint, nil
 	}, dbos.WithStepName(ShapeStepName))
