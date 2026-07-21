@@ -51,6 +51,9 @@ without writing a single line of recovery code.
   directions), scheduled and debounced pipelines, stage-level forking, and
   per-child queue controls — each as a small, composable surface over the
   DBOS primitive it wraps.
+- **Durable control flow** — `Branch`, `Switch`, and `Loop` make routing and
+  polling checkpointed stages instead of hand-written workflow code, and
+  `Status`/`Attach` reconcile any persisted run ID from any process.
 
 ## Installation
 

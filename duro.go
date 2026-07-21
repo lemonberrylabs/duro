@@ -60,9 +60,13 @@
 //
 // Pipelines are also registrable as first-class workflows: Register names a
 // pipeline as a DBOS workflow, RegisterScheduled runs one on a cron schedule
-// (typed Pipeline[time.Time, R]), and RegisterDebounced collapses bursts of
-// triggers into a single run. ForkFromStage restarts a completed or failed
-// run from a named stage — optionally onto a different application version.
+// (typed Pipeline[time.Time, R]), RegisterDebounced collapses bursts of
+// triggers into a single run, and RegisterWorkflow covers hand-written
+// workflow functions. Runs are tracked by workflow ID from any process:
+// Status/StatusAll reconcile a persisted ID against the engine, Attach
+// reconnects to a live handle, and ForkFromStage restarts a completed or
+// failed run from a named stage — optionally onto a different application
+// version.
 package duro
 
 import (
@@ -86,7 +90,7 @@ import (
 type Context = dbos.DBOSContext
 
 // WorkflowFunc is a hand-written durable workflow function, the kind
-// dbos.RegisterWorkflow registers and Workflow adapts into a FanOut child.
+// RegisterWorkflow registers and Workflow adapts into a FanOut child.
 // Registered pipelines (Register) never touch this type.
 type WorkflowFunc[P, R any] = dbos.Workflow[P, R]
 
