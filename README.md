@@ -233,7 +233,7 @@ var Jobs = duro.NewQueue("jobs", duro.WithConcurrency(4)) // declared once, refe
 
 var ProcessAll = duro.Pipe3(
 	duro.Expand("explode", func(_ context.Context, js []Job) ([]Job, error) { return js, nil }),
-	duro.FanOut("process", Jobs, duro.Workflow(ProcessJob)), // ProcessJob: a registered dbos.Workflow
+	duro.FanOut("process", Jobs, duro.Workflow(ProcessJob)), // ProcessJob: a hand-written workflow
 	duro.Reduce("merge", mergeResults, Merged{}),
 )
 ```
@@ -387,7 +387,7 @@ pipeline construction must be deterministic.
 
 ## How it works
 
-`dbos.DBOSContext` implements `context.Context`, and
+`duro.Context` (DBOS's context type) implements `context.Context`, and
 [samber/ro](https://github.com/samber/ro) — the reactive engine under duro's
 hood — propagates the subscription context unchanged through its operators.
 `duro.Run` subscribes the composed pipeline with the workflow's context; each

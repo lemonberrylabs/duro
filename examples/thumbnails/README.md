@@ -58,5 +58,8 @@ you need imperative control flow around the pipeline.
 
 - Bump `WithConcurrency(3)` down to 1 and watch deliveries serialize.
 - Give the batch 20 images and watch the rate limiter pace render starts.
-- Kill the process mid-gallery and run again with the same run ID: the parent
-  re-attaches to every child it already enqueued.
+- The demo scopes run and child IDs to the invocation (`batchTag` in
+  `main.go`) so it stays repeatable against a used database. Delete the tag —
+  production-style stable IDs — then kill the process mid-gallery and run
+  again: the parent and every child it already enqueued are re-attached, not
+  re-run.

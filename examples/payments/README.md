@@ -44,10 +44,10 @@ error, not a runtime decode failure.
 
 ## Things to try
 
-- Kill the process while the reviewed payment waits for approval, run again,
-  and approve: the workflow recovers mid-`Recv` and completes. (`Start` the
-  payment with a fixed workflow ID first — `duro.Register` docs — or grab the
-  printed run ID.)
+- Kill the process (hard — `kill -9`, not a graceful drain) while the
+  reviewed payment waits for approval, run again, and approve: the workflow
+  recovers mid-`Recv` and completes. Start it with a fixed ID so the second
+  process knows where to send: `reviewed.Start(app, p, duro.WithWorkflowID("p-200"))`.
 - Change `Approvals` to `duro.NewTopic[string]("approvals")` in one place and
   watch the compiler point at every mismatched writer and reader.
 - Lower `riskCheck`'s `WithTimeout` below the simulated call latency and

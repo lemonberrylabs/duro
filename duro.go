@@ -47,8 +47,10 @@
 // sleep), Send/Recv (durable mailbox messaging — external signals and
 // human-in-the-loop pauses), SetEvent/GetEvent (progress events published and
 // read durably), and ToStream/FromStream (durable streams written and drained
-// durably). Messaging stages take Portable() to serialize payloads in DBOS's
-// cross-language format.
+// durably). Messaging goes through typed channels — Topic, Event, Stream —
+// declared once and referenced by both sides, so keys and payload types
+// cannot drift; declare a channel with Portable() to serialize its payloads
+// in DBOS's cross-language format.
 //
 // Pipelines are also registrable as first-class workflows: Register names a
 // pipeline as a DBOS workflow, RegisterScheduled runs one on a cron schedule

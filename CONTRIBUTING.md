@@ -16,7 +16,9 @@ go test ./... -count=1
 Point the tests at a different Postgres with `DURO_TEST_DATABASE_URL`
 (default: `postgres://$USER@localhost:5432/duro_test`).
 
-The example app uses its own database:
+Each example app uses its own database — see the README in each directory
+(`examples/payments`, `examples/thumbnails`, `examples/housekeeping`). The
+orders example:
 
 ```bash
 createdb duro_demo
