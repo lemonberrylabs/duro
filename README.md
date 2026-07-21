@@ -17,14 +17,18 @@ designed so that code which would corrupt recovery either doesn't compile or
 fails fast with a clear error.
 
 ```go
-func OrderWorkflow(ctx dbos.DBOSContext, o Order) (Confirmation, error) {
-	return duro.Run(ctx, o, duro.Pipe4(
-		duro.Step("validate", validateOrder),
-		duro.Step("reserve", reserveInventory),
-		duro.Step("charge", chargePayment, duro.WithMaxRetries(3)),
-		duro.Step("notify", sendConfirmation),
-	))
-}
+var OrderPipeline = duro.Pipe4(
+	duro.Step("validate", validateOrder),
+	duro.Step("reserve", reserveInventory),
+	duro.Step("charge", chargePayment, duro.WithMaxRetries(3)),
+	duro.Step("notify", sendConfirmation),
+)
+
+// at startup:
+orders := duro.Register(app, "orders", OrderPipeline)
+// anywhere:
+handle, err := orders.Start(app, order)
+confirmation, err := handle.Result()
 ```
 
 Kill the process right after `reserve` completes. On restart, `validate` and
@@ -43,8 +47,10 @@ without writing a single line of recovery code.
 - **Safety as a feature** — three guard layers (compiler, construction-time,
   execution-time) make the classic durable-workflow footguns hard to fire; see
   [Built-in safety](#built-in-safety).
-- **Tiny surface** — seven stage constructors, `Pipe1`…`Pipe8`, `Run`/`RunAll`.
-  That's the whole API.
+- **The whole DBOS toolkit, typed** — messaging, events, and streams (both
+  directions), scheduled and debounced pipelines, stage-level forking, and
+  per-child queue controls — each as a small, composable surface over the
+  DBOS primitive it wraps.
 
 ## Installation
 
@@ -56,6 +62,8 @@ Requires Go 1.26+ and PostgreSQL (DBOS's system database).
 
 ## Quickstart
 
+A complete durable application — note the single import:
+
 ```go
 package main
 
@@ -65,7 +73,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/dbos-inc/dbos-transact-golang/dbos"
 	"github.com/lemonberrylabs/duro"
 )
 
@@ -79,36 +86,37 @@ type Receipt struct {
 	PaymentID string
 }
 
-func ChargeOrder(ctx dbos.DBOSContext, o Order) (Receipt, error) {
-	return duro.Run(ctx, o, duro.Pipe2(
-		duro.Step("charge", func(_ context.Context, o Order) (string, error) {
-			return "pay-" + o.ID, nil // call your payment provider here
-		}, duro.WithMaxRetries(3)),
-		duro.Step("receipt", func(_ context.Context, paymentID string) (Receipt, error) {
-			return Receipt{OrderID: o.ID, PaymentID: paymentID}, nil
-		}),
-	))
-}
+var ChargePipeline = duro.Pipe2(
+	duro.Step("charge", func(_ context.Context, o Order) (Receipt, error) {
+		return Receipt{OrderID: o.ID, PaymentID: "pay-" + o.ID}, nil // call your payment provider here
+	}, duro.WithMaxRetries(3)),
+	duro.Tap("audit", func(_ context.Context, r Receipt) error {
+		fmt.Printf("audited %s\n", r.OrderID)
+		return nil
+	}),
+)
 
 func main() {
-	ctx, err := dbos.NewDBOSContext(context.Background(), dbos.Config{
-		AppName:     "quickstart",
+	app, err := duro.New(context.Background(), duro.Config{
+		Name:        "quickstart",
 		DatabaseURL: os.Getenv("DBOS_SYSTEM_DATABASE_URL"),
 	})
 	if err != nil {
 		panic(err)
 	}
-	dbos.RegisterWorkflow(ctx, ChargeOrder)
-	if err := dbos.Launch(ctx); err != nil {
+
+	charge := duro.Register(app, "charge-order", ChargePipeline)
+
+	if err := app.Launch(); err != nil {
 		panic(err)
 	}
-	defer dbos.Shutdown(ctx, 5*time.Second)
+	defer app.Shutdown(5 * time.Second)
 
-	handle, err := dbos.RunWorkflow(ctx, ChargeOrder, Order{ID: "42", AmountCents: 1999})
+	handle, err := charge.Start(app, Order{ID: "42", AmountCents: 1999})
 	if err != nil {
 		panic(err)
 	}
-	receipt, err := handle.GetResult()
+	receipt, err := handle.Result()
 	if err != nil {
 		panic(err)
 	}
@@ -130,23 +138,62 @@ DBOS_SYSTEM_DATABASE_URL=postgres://$USER@localhost:5432/quickstart go run .
 | `duro.Filter(name, pred)` | drop items failing the predicate | ✅ predicate is a step |
 | `duro.Expand(name, fn)` | one item → many (`T → []R`), emitted in order | ✅ checkpointed step |
 | `duro.Reduce(name, fn, seed)` | fold the stream; emits the final accumulator | ✅ one step per accumulation |
-| `duro.FanOut(name, queue, wf)` | parallel map: each item runs as a child workflow on a DBOS queue | ✅ every child is a durable workflow |
+| `duro.FanOut(name, queue, wf)` | parallel map: each item runs as a child workflow on a declared `Queue` | ✅ every child is a durable workflow |
 | `duro.Parallel(name, max, fn)` | parallel map: concurrent steps in-process, at most `max` at a time | ✅ pre-assigned step per item |
 | `duro.Delay(name, d)` | durable pause per item | ✅ recovery resumes the remaining time |
-| `duro.Send(name, topic, fn)` | message another workflow's mailbox per item | ✅ no re-send on replay |
-| `duro.Recv(name, topic, timeout)` | pause until an external message arrives; emits it | ✅ no double-consume on replay |
-| `duro.SetEvent(name, key, fn)` | publish per-item progress readable via `dbos.GetEvent` | ✅ checkpointed |
-| `duro.ToStream(name, key)` | append items to a durable stream readable via `dbos.ReadStream` | ✅ checkpointed; closed at completion |
+| `duro.Send(name, topic, fn)` | message another workflow's mailbox on a typed `Topic` | ✅ no re-send on replay |
+| `duro.Recv(name, topic, timeout)` | pause until a `Topic` message arrives; emits it | ✅ no double-consume on replay |
+| `duro.SetEvent(name, event, fn)` | publish per-item progress on a typed `Event` | ✅ checkpointed |
+| `duro.GetEvent(name, event, fn, timeout)` | read another workflow's `Event`; emits it | ✅ replay returns the observed value |
+| `duro.ToStream(name, stream)` | append items to a typed durable `Stream`, closed at completion | ✅ checkpointed |
+| `duro.FromStream(name, stream, fn)` | drain another workflow's `Stream`; emits its values | ✅ the whole read is one checkpoint |
 | `duro.Pure(name, fn)` | cheap reshaping between stages | ❌ re-executes on replay — must be deterministic and side-effect free |
 | `duro.UnsafeOperator(name, op)` | escape hatch for raw ro operators | ⚠️ you're on your own (runtime guards still apply) |
 
-Stages compose with `duro.Pipe1`…`Pipe8` into a `Pipeline[P, R]`, and run with:
+Stages compose with `duro.Pipe1`…`Pipe8` into a `Pipeline[P, R]`. Register
+one as a workflow (`duro.Register`, below) or run it inside a hand-written
+workflow body:
 
 - `duro.Run(ctx, input, pipeline)` — returns the last emitted value
 - `duro.RunAll(ctx, input, pipeline)` — returns every emitted value
 
-Per-stage retries with exponential backoff: `duro.WithMaxRetries(n)`,
-`duro.WithBaseInterval(d)`.
+Hand-written workflows are declared against `duro.Context` — an alias for
+DBOS's context type, so it works with every dbos API while workflow code
+imports only duro:
+
+```go
+func InvoiceWorkflow(ctx duro.Context, b Batch) (Invoice, error) {
+	return duro.Run(ctx, b, InvoicePipeline)
+}
+```
+
+### Stage options
+
+Every step-backed stage takes functional options:
+
+- **Retries** — `WithMaxRetries(n)`, `WithBaseInterval(d)`, `WithMaxInterval(d)`,
+  `WithBackoffFactor(f)` for the exponential-backoff envelope, and
+  `WithRetryPredicate(pred)` to spend retries on transient errors only:
+
+  ```go
+  duro.Step("charge", chargePayment,
+      duro.WithMaxRetries(5),
+      duro.WithBaseInterval(200*time.Millisecond),
+      duro.WithMaxInterval(10*time.Second),
+      duro.WithRetryPredicate(func(err error) bool { return !errors.Is(err, ErrCardDeclined) }),
+  )
+  ```
+
+- **Timeouts** — `WithTimeout(d)` cancels each attempt's step context after
+  `d` (per attempt; the stage function must honor cancellation). For a durable
+  deadline on a whole pipeline run, start its workflow from a context derived
+  with `dbos.WithTimeout`; for child workflows, see `WithChildTimeout` below.
+
+- **Serialization** — declare a channel with `duro.Portable()`
+  (`duro.NewTopic[M](name, duro.Portable())`) to write its payloads in DBOS's
+  cross-language format so Python/TypeScript DBOS apps can consume them.
+  Readers need nothing special — DBOS decodes by each value's recorded
+  serialization.
 
 ### Multi-item pipelines
 
@@ -155,7 +202,7 @@ own checkpoint, so a crash mid-batch resumes at the exact item and stage where
 it stopped:
 
 ```go
-func InvoiceWorkflow(ctx dbos.DBOSContext, b Batch) (Invoice, error) {
+func InvoiceWorkflow(ctx duro.Context, b Batch) (Invoice, error) {
 	return duro.Run(ctx, b, duro.Pipe5(
 		duro.Expand("explode", func(_ context.Context, b Batch) ([]LineItem, error) {
 			return b.Items, nil
@@ -182,23 +229,51 @@ distribution across processes are all governed by the queue — and every child
 is independently durable:
 
 ```go
-// At startup:
-dbos.RegisterQueue(dctx, "jobs", dbos.WithGlobalConcurrency(4))
+var Jobs = duro.NewQueue("jobs", duro.WithConcurrency(4)) // declared once, referenced by value
 
-func ProcessAll(ctx dbos.DBOSContext, jobs []Job) (Merged, error) {
-	return duro.Run(ctx, jobs, duro.Pipe3(
-		duro.Expand("explode", func(_ context.Context, js []Job) ([]Job, error) { return js, nil }),
-		duro.FanOut("process", "jobs", ProcessJob), // ProcessJob: a registered dbos.Workflow
-		duro.Reduce("merge", mergeResults, Merged{}),
-	))
-}
+var ProcessAll = duro.Pipe3(
+	duro.Expand("explode", func(_ context.Context, js []Job) ([]Job, error) { return js, nil }),
+	duro.FanOut("process", Jobs, duro.Workflow(ProcessJob)), // ProcessJob: a registered dbos.Workflow
+	duro.Reduce("merge", mergeResults, Merged{}),
+)
 ```
+
+Registering a pipeline with `Register` automatically registers every queue it
+references — no separate registration call, no name to keep in sync. (For
+pipelines run with `Run` inside hand-written workflows, call
+`duro.RegisterQueues(app, Jobs)` once at startup.) Queue knobs are duro
+options: `WithConcurrency`, `WithWorkerConcurrency`, `WithRateLimit`,
+`WithPriorities`, `WithPartitions`. Declaring the same queue name twice with
+different configurations fails loudly at registration.
 
 Children are enqueued in stream order with IDs derived from the parent's step
 counter, so a recovered parent re-attaches to its children instead of spawning
 duplicates; results are awaited and emitted in input order, each checkpointed
 in the parent. Determinism is preserved because DBOS checkpoints both the
 spawns and the awaits.
+
+Child workflows are configured with `ChildOption`s. Identity options derive a
+per-child value from the item; policy options apply to every child:
+
+```go
+duro.FanOut("process", Jobs, duro.Workflow(ProcessJob),
+	duro.WithChildID(func(j Job) string { return "job-" + j.ID }), // idempotency across runs
+	duro.WithChildDeduplicationID(func(j Job) string { return j.CustomerID }),
+	duro.WithChildDeduplicationPolicy(duro.DeduplicationReturnExisting),
+	duro.WithChildPartitionKey(func(j Job) string { return j.Region }),
+	duro.WithChildPriority(2),                    // queue must enable priorities
+	duro.WithChildDelay(time.Minute),             // start children DELAYED
+	duro.WithChildTimeout(10*time.Minute),        // durable per-child deadline
+	duro.WithChildAuthenticatedUser("billing-svc"),
+	duro.WithChildAppVersion(version),            // pin recovery to a code version
+	duro.WithPortableChildren(),                  // cross-language serialization
+)
+```
+
+Item-derived options are typed by the stage's item; a mismatch panics at
+construction time, like every other stage validation. A registered pipeline is
+itself a valid FanOut child — pass it directly:
+`duro.FanOut("sub", Jobs, childPipeline)`.
 
 When you don't need queue-level distribution or per-child durability,
 `duro.Parallel(name, max, fn)` is the lightweight sibling: concurrent **steps**
@@ -208,28 +283,80 @@ queue, no polling latency.
 
 ### Signals, events, and streams
 
-The rest of DBOS's workflow toolkit is available as stages too:
+Messaging goes through **typed channels**: declare a `Topic`, `Event`, or
+`Stream` once, and both sides reference the value. The key lives in one place
+and the payload type is compiler-checked — sending an `Approval` where the
+receiver expects an `Invoice` doesn't compile:
 
 ```go
+var (
+	Approvals = duro.NewTopic[Approval]("approvals")
+	Receipts  = duro.NewStream[Receipt]("receipts")
+)
+
 duro.Pipe5(
 	duro.Step("prepare", prepare),
-	duro.Delay[Prepared]("cool-off", 24*time.Hour),      // durable sleep — survives restarts
-	duro.Recv[Prepared, Approval]("await-approval", "approvals", 72*time.Hour),
-	duro.Step("execute", execute),                        // human-in-the-loop, durably
-	duro.ToStream[Receipt]("publish", "receipts"),        // readers consume incrementally
+	duro.Delay[Prepared]("cool-off", 24*time.Hour),        // durable sleep — survives restarts
+	duro.Recv[Prepared]("await-approval", Approvals, 72*time.Hour),
+	duro.Step("execute", execute),                          // human-in-the-loop, durably
+	duro.ToStream("publish", Receipts),                     // readers consume incrementally
 )
 ```
 
 - `Delay` checkpoints its wake-up deadline: a workflow recovered mid-sleep
   sleeps only the remaining time; a replayed sleep is instant.
-- `Recv` parks the pipeline until a message arrives on the workflow's mailbox
-  (sent with `dbos.Send` from any workflow or plain client); receipt is
-  checkpointed so recovery never consumes a second message. `Send` is the
-  outbound counterpart.
-- `SetEvent` publishes per-item progress readable with `dbos.GetEvent` while
-  the pipeline runs; `ToStream` appends each item to a durable stream that
-  `dbos.ReadStream` consumers read incrementally, closed when the pipeline
-  completes.
+- `Recv` parks the pipeline until a message arrives on the workflow's mailbox;
+  receipt is checkpointed so recovery never consumes a second message. `Send`
+  is the in-pipeline counterpart; from a plain client, `Approvals.Send(app,
+  workflowID, approval)`.
+- `SetEvent` publishes per-item progress readable while the pipeline runs;
+  `ToStream` appends each item to a durable stream, closed when the pipeline
+  completes. Clients read with `event.Get(app, id, timeout)` and
+  `stream.Read(app, id)`.
+- Both have read-side stages: `GetEvent` durably observes another workflow's
+  event, and `FromStream` drains another workflow's stream into the pipeline —
+  one checkpoint for the whole read, so replay never re-reads a stream that
+  has since changed. Bound the wait with `duro.WithTimeout`.
+
+### Pipelines as workflows
+
+`Register` makes a pipeline a first-class DBOS workflow — no wrapper function
+to write — and two variants cover scheduling and burst-collapsing:
+
+```go
+wf := duro.Register(app, "invoice", invoicePipeline) // after duro.New, before app.Launch
+handle, err := wf.Start(app, batch)                  // → duro.Handle[Invoice]
+result, err := handle.Result()
+
+// Cron pipelines: input is the tick time, enforced at compile time.
+duro.RegisterScheduled(app, "nightly-report", "0 0 2 * * *",
+	reportPipeline) // Pipeline[time.Time, Report]
+
+// Debounced pipelines: bursts collapse into one run with the last input.
+deb := duro.RegisterDebounced(app, "reindex", reindexPipeline)
+deb.Debounce(app, userID, 30*time.Second, req) // each call pushes the start back
+```
+
+The registered name is the pipeline's **durable identity**: in-flight runs are
+recovered by looking it up, so register the same name on every process start.
+`app.Launch()` checks for runs recorded under names that are no longer
+registered and warns about each one — a renamed pipeline is a startup warning,
+not a silent recovery failure.
+
+### Forking from a stage
+
+`ForkFromStage` restarts an existing run from a named stage: earlier stages
+replay from checkpoints, the named stage and everything after re-execute —
+optionally on a different application version (the recovery tool for re-running
+a workflow on fixed code after a bad deploy):
+
+```go
+handle, err := duro.ForkFromStage[Confirmation](app, duro.Fork{
+	WorkflowID:         failedRunID,
+	Stage:              "charge",
+	ApplicationVersion: fixedVersion, // optional; inherits when empty
+})
+```
 
 ## Built-in safety
 
@@ -268,20 +395,35 @@ stage recovers it and executes its function via `dbos.RunAsStep`, one durable
 checkpoint per stage execution. Synchronous emission on the workflow goroutine
 keeps step order deterministic — exactly what DBOS replay requires.
 
-## Example app
+## Example apps
 
-A complete demo lives in [`examples/orders`](examples/orders): the same order
-workflow written both as plain sequential DBOS steps and as a duro pipeline
-(their recorded checkpoints are identical), a complex batch pipeline, and a
-crash-recovery demo:
+Each example is a runnable app with its own README; together they cover the
+whole feature set:
 
-```bash
-createdb duro_demo
-cd examples/orders
-go run .                                      # all variants + step-sequence dumps
-go run . -variant=duro -crash-after=reserve   # die mid-workflow…
-go run .                                      # …recover: watch replayed steps keep their old timestamps
-```
+- [`examples/payments`](examples/payments) — **signals & resilience**: retry
+  options and predicates, per-attempt timeouts, durable pauses,
+  human-in-the-loop approval over a typed Topic, progress Events, and a
+  portable receipt Stream drained by a second pipeline.
+- [`examples/thumbnails`](examples/thumbnails) — **fan-out fleets**: queue
+  declarations (concurrency, rate limits, priorities, partitions), every
+  child option (idempotent IDs, deduplication, timeouts, delays, auth), a
+  hand-written child on `duro.Context` with `RunAll` and `Parallel`, and a
+  registered pipeline used directly as a FanOut child.
+- [`examples/housekeeping`](examples/housekeeping) — **operations**: cron
+  pipelines, debounced bursts, forking a finished run from a named stage
+  after a fix, and a three-phase walkthrough of the durable-identity
+  contract and the stranded-run warning.
+- [`examples/orders`](examples/orders) — **the fundamentals**: the same order
+  workflow written both as plain sequential DBOS steps and as a duro pipeline
+  (their recorded checkpoints are identical), plus a crash-recovery demo:
+
+  ```bash
+  createdb duro_demo
+  cd examples/orders
+  go run .                                      # all variants + step-sequence dumps
+  go run . -variant=duro -crash-after=reserve   # die mid-workflow…
+  go run .                                      # …recover: watch replayed steps keep their old timestamps
+  ```
 
 ## Status
 
