@@ -125,6 +125,11 @@ func dispatchStage[T, R any](kind, name string, route func(ctx context.Context, 
 // nothing drops the item, like Filter). On replay the recorded predicate
 // verdicts reproduce the exact iteration count. Pair the body with Delay for
 // durable polling. Applied per item on multi-item streams.
+//
+// Iterations are unbounded, and a durable loop is more durable than a bug
+// deserves: a predicate that can never report done keeps checkpointing and
+// resumes across restarts. Give the loop a natural bound (track attempts in
+// T and fail past a limit), or stop a runaway run with dbos.CancelWorkflow.
 func Loop[T any](name string, body Pipeline[T, T], until func(ctx context.Context, in T) (bool, error), opts ...StepOption) Stage[T, T] {
 	mustValidStage("Loop", name, until == nil)
 	mustValidEmbedded("Loop", name, body)

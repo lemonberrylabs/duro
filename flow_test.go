@@ -2,6 +2,7 @@ package duro_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -113,6 +114,37 @@ func mutableBranchWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
 	))
 }
 
+// loopDropWorkflow's body filters its item away: the loop must end without
+// emitting, and Run reports ErrNoValue.
+func loopDropWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
+	return duro.Run(ctx, n, duro.Pipe1(
+		duro.Loop("drop-loop", duro.Pipe1(
+			duro.Filter("drop", func(_ context.Context, _ int) (bool, error) { return false, nil }),
+		), func(_ context.Context, _ int) (bool, error) { return true, nil }),
+	))
+}
+
+var armAfterFailureRuns atomic.Int64
+
+// branchFailureWorkflow fails inside the then-arm on item 2.
+func branchFailureWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+	arm := duro.Pipe1(duro.Step("check", func(_ context.Context, v int) (int, error) {
+		if v == 2 {
+			return 0, errors.New("boom: two is forbidden")
+		}
+		armAfterFailureRuns.Add(1)
+		return v, nil
+	}))
+	return duro.Run(ctx, ns, duro.Pipe3(
+		duro.Expand("explode", explode),
+		duro.Branch("route", func(_ context.Context, _ int) (bool, error) { return true, nil },
+			arm,
+			duro.Pipe1(duro.Pure("as-is", func(v int) int { return v })),
+		),
+		duro.Collect[int]("collect"),
+	))
+}
+
 // flowQueue is only referenced inside a Branch arm; registering the pipeline
 // must still auto-register it.
 var flowQueue = duro.NewQueue("duro-test-flow", duro.WithConcurrency(2))
@@ -126,6 +158,8 @@ func registerFlowWorkflows(ctx dbos.DBOSContext) {
 	dbos.RegisterWorkflow(ctx, subWorkflow, dbos.WithWorkflowName("subWorkflow"))
 	dbos.RegisterWorkflow(ctx, collectEmptyWorkflow, dbos.WithWorkflowName("collectEmptyWorkflow"))
 	dbos.RegisterWorkflow(ctx, mutableBranchWorkflow, dbos.WithWorkflowName("mutableBranchWorkflow"))
+	dbos.RegisterWorkflow(ctx, loopDropWorkflow, dbos.WithWorkflowName("loopDropWorkflow"))
+	dbos.RegisterWorkflow(ctx, branchFailureWorkflow, dbos.WithWorkflowName("branchFailureWorkflow"))
 
 	flowQueueWf = duro.Register(app, "flowQueuePipeline", duro.Pipe3(
 		duro.Expand("explode", explode),
@@ -296,4 +330,37 @@ func TestFlowConstructionPanics(t *testing.T) {
 	assertPanics(t, "Sub zero-value pipeline", func() {
 		duro.Sub("s", duro.Pipeline[int, int]{})
 	})
+}
+
+// TestLoopBodyDropsItem proves a body that emits nothing (a Filter inside)
+// drops the item like Filter does, ending the loop without a value.
+func TestLoopBodyDropsItem(t *testing.T) {
+	handle, err := dbos.RunWorkflow(dctx, loopDropWorkflow, 1)
+	if err != nil {
+		t.Fatalf("starting workflow: %v", err)
+	}
+	_, err = handle.GetResult()
+	if err == nil || !strings.Contains(err.Error(), "without emitting a value") {
+		t.Fatalf("workflow error = %v, want ErrNoValue (the loop dropped its item)", err)
+	}
+}
+
+// TestBranchArmFailureAborts proves a stage failing inside an embedded arm
+// fails the pipeline and stops items queued behind it — the abort machinery
+// reaches into embedded pipelines.
+func TestBranchArmFailureAborts(t *testing.T) {
+	armAfterFailureRuns.Store(0)
+
+	handle, err := dbos.RunWorkflow(dctx, branchFailureWorkflow, []int{1, 2, 3})
+	if err != nil {
+		t.Fatalf("starting workflow: %v", err)
+	}
+	_, err = handle.GetResult()
+	if err == nil || !strings.Contains(err.Error(), "two is forbidden") {
+		t.Fatalf("workflow error = %v, want the arm failure", err)
+	}
+	// Item 1 passed, item 2 failed inside the arm, item 3 must never route.
+	if got := armAfterFailureRuns.Load(); got != 1 {
+		t.Errorf("arm executions = %d, want 1 (only item 1)", got)
+	}
 }
