@@ -8,8 +8,6 @@ import (
 	"os/user"
 	"time"
 
-	"github.com/dbos-inc/dbos-transact-golang/dbos"
-
 	"github.com/lemonberrylabs/duro"
 )
 
@@ -23,16 +21,16 @@ func main() {
 		fatal("initializing: %v", err)
 	}
 
-	// The one hand-written workflow registers through dbos directly — the
-	// only dbos call in this example. Its body is dbos-free (duro.Context).
-	dbos.RegisterWorkflow(app.Context(), RenderImage, dbos.WithWorkflowName("RenderImage"))
+	// The hand-written workflow registers like everything else — through
+	// duro. The whole example is dbos-free.
+	render := duro.RegisterWorkflow(app, "RenderImage", RenderImage)
 
 	// Registered pipelines: the delivery child, then the gallery that fans
 	// out onto it. Register auto-registers renderQueue and deliverQueue
 	// because the pipelines reference them.
 	batchTag := time.Now().Format("150405.000") // scope demo identities to this invocation
 	deliver := duro.Register(app, "deliver", DeliverPipeline)
-	gallery := duro.Register(app, "gallery", galleryPipeline(deliver, batchTag))
+	gallery := duro.Register(app, "gallery", galleryPipeline(render, deliver, batchTag))
 
 	if err := app.Launch(); err != nil {
 		fatal("launching: %v", err)

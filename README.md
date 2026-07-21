@@ -159,12 +159,15 @@ workflow body:
 
 Hand-written workflows are declared against `duro.Context` — an alias for
 DBOS's context type, so it works with every dbos API while workflow code
-imports only duro:
+imports only duro — and registered with `duro.RegisterWorkflow`:
 
 ```go
 func InvoiceWorkflow(ctx duro.Context, b Batch) (Invoice, error) {
 	return duro.Run(ctx, b, InvoicePipeline)
 }
+
+invoice := duro.RegisterWorkflow(app, "invoice", InvoiceWorkflow) // before app.Launch
+handle, err := invoice.Start(app, batch)
 ```
 
 ### Stage options
@@ -233,7 +236,7 @@ var Jobs = duro.NewQueue("jobs", duro.WithConcurrency(4)) // declared once, refe
 
 var ProcessAll = duro.Pipe3(
 	duro.Expand("explode", func(_ context.Context, js []Job) ([]Job, error) { return js, nil }),
-	duro.FanOut("process", Jobs, duro.Workflow(ProcessJob)), // ProcessJob: a hand-written workflow
+	duro.FanOut("process", Jobs, duro.Workflow(ProcessJob)), // or pass a Registered/PipelineWorkflow directly
 	duro.Reduce("merge", mergeResults, Merged{}),
 )
 ```

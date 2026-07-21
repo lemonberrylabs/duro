@@ -51,10 +51,44 @@ var debouncedPipeline = duro.Pipe1(
 	}),
 )
 
+// handWrittenSum is a hand-written workflow: imperative code around a
+// pipeline, using RunAll to keep every emitted value.
+func handWrittenSum(ctx duro.Context, ns []int) (int, error) {
+	squares, err := duro.RunAll(ctx, ns, duro.Pipe2(
+		duro.Expand("explode", explode),
+		duro.Step("square", func(_ context.Context, v int) (int, error) { return v * v, nil }),
+	))
+	if err != nil {
+		return 0, err
+	}
+	sum := 0
+	for _, v := range squares {
+		sum += v
+	}
+	return sum, nil
+}
+
+var (
+	handWrittenWf *duro.RegisteredWorkflow[[]int, int]
+	fanIntoFnWf   *duro.PipelineWorkflow[[][]int, []int]
+)
+
 func registerPipelineWorkflows(ctx dbos.DBOSContext) {
 	registeredWf = duro.Register(ctx, "registeredPipeline", registeredPipeline)
 	duro.RegisterScheduled(ctx, "cronPipeline", "* * * * * *", scheduledPipeline) // every second
 	debouncer = duro.RegisterDebounced(ctx, "debouncedPipeline", debouncedPipeline)
+
+	// Deliberately registered through the App (ctx here is *duro.App in
+	// TestMain): duro.RegisterWorkflow must unwrap it — the raw
+	// dbos.RegisterWorkflow would silently no-op on the App.
+	handWrittenWf = duro.RegisterWorkflow(ctx, "handWrittenSum", handWrittenSum)
+	fanIntoFnWf = duro.Register(ctx, "fanIntoFn", duro.Pipe3(
+		duro.Expand("explode-batches", func(_ context.Context, batches [][]int) ([][]int, error) {
+			return batches, nil
+		}),
+		duro.FanOut("fan", fanQueue, handWrittenWf),
+		collectInts(),
+	))
 }
 
 // --- tests ------------------------------------------------------------------
@@ -145,4 +179,42 @@ func TestDebouncedPipeline(t *testing.T) {
 	if got := debouncedRuns.Load(); got != 1 {
 		t.Errorf("pipeline executions = %d, want 1", got)
 	}
+}
+
+// TestRegisterWorkflow proves hand-written workflows register, start, and
+// carry their durable name without any direct dbos call — including when the
+// registration context is the App itself.
+func TestRegisterWorkflow(t *testing.T) {
+	handle, err := handWrittenWf.Start(app, []int{1, 2, 3})
+	if err != nil {
+		t.Fatalf("starting hand-written workflow: %v", err)
+	}
+	result, err := handle.Result()
+	if err != nil {
+		t.Fatalf("hand-written workflow failed: %v", err)
+	}
+	if result != 14 {
+		t.Errorf("result = %d, want 14 (1+4+9)", result)
+	}
+	status, err := handle.Status()
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if status.Name != "handWrittenSum" {
+		t.Errorf("workflow name = %q, want %q", status.Name, "handWrittenSum")
+	}
+}
+
+// TestRegisteredWorkflowAsFanOutChild proves a *RegisteredWorkflow is a
+// WorkflowRef: FanOut takes it directly, no duro.Workflow adapter.
+func TestRegisteredWorkflowAsFanOutChild(t *testing.T) {
+	handle, err := fanIntoFnWf.Start(app, [][]int{{1, 2}, {3}})
+	if err != nil {
+		t.Fatalf("starting parent: %v", err)
+	}
+	result, err := handle.Result()
+	if err != nil {
+		t.Fatalf("parent failed: %v", err)
+	}
+	assertInts(t, result, []int{5, 9}) // 1+4, 9
 }

@@ -70,11 +70,11 @@ var (
 var renderRuns atomic.Int64
 
 // --- the render child: a hand-written workflow -------------------------------
-// Hand-written workflows are declared against duro.Context (an alias for
-// DBOS's context type) and register through dbos.RegisterWorkflow — see
-// main.go. Inside, RunAll executes a pipeline and returns every emitted
-// value, and Parallel renders the three sizes concurrently in-process,
-// bounded to 2 at a time, each size a checkpointed step.
+// Hand-written workflows are declared against duro.Context and registered
+// with duro.RegisterWorkflow — see main.go. Inside, RunAll executes a
+// pipeline and returns every emitted value, and Parallel renders the three
+// sizes concurrently in-process, bounded to 2 at a time, each size a
+// checkpointed step.
 
 var renderSizes = duro.Pipe2(
 	duro.Expand("sizes", func(_ context.Context, img Image) ([]int, error) {
@@ -142,12 +142,12 @@ var DeliverPipeline = duro.Pipe2(
 // is repeatable against a used database. In production you would omit it —
 // stable IDs like "render-"+img.ID are exactly what makes renders idempotent
 // across deploys and re-runs.
-func galleryPipeline(rendered *duro.PipelineWorkflow[Rendered, Delivered], batchTag string) duro.Pipeline[[]Image, Manifest] {
+func galleryPipeline(render *duro.RegisteredWorkflow[Image, Rendered], rendered *duro.PipelineWorkflow[Rendered, Delivered], batchTag string) duro.Pipeline[[]Image, Manifest] {
 	return duro.Pipe4(
 		duro.Expand("explode", func(_ context.Context, imgs []Image) ([]Image, error) {
 			return imgs, nil
 		}),
-		duro.FanOut("render", renderQueue, duro.Workflow(RenderImage),
+		duro.FanOut("render", renderQueue, render,
 			duro.WithChildID(func(img Image) string { return "render-" + batchTag + "-" + img.ID }),
 			duro.WithChildDeduplicationID(func(img Image) string { return img.ContentHash }),
 			duro.WithChildDeduplicationPolicy(duro.DeduplicationReturnExisting),

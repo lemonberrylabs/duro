@@ -16,13 +16,13 @@ go run .    # or: DBOS_SYSTEM_DATABASE_URL=... go run .
 | `NewQueue` + `WithConcurrency`, `WithRateLimit`, `WithPriorities` | `renderQueue` — 3 concurrent renders fleet-wide, ≤20 starts/s |
 | `WithPartitions`, `WithWorkerConcurrency` | `deliverQueue` — per-region concurrency, 2 deliveries per executor |
 | Automatic queue registration | no `RegisterQueues` call anywhere: `Register` sees the queues the pipelines reference |
-| `FanOut` + `duro.Workflow(fn)` | the render stage fans out into a hand-written workflow |
+| `FanOut` + `*RegisteredWorkflow` | the render stage fans out into the hand-written workflow's ref |
 | `FanOut` + pipeline child | the deliver stage fans out into `DeliverPipeline` — a `*PipelineWorkflow` passed directly |
 | `WithChildID` | renders are idempotent across gallery runs: the rerun re-attaches instead of re-rendering |
 | `WithChildDeduplicationID` + `duro.DeduplicationReturnExisting` | the duplicate upload collapses onto its sibling's render |
 | `WithChildPriority`, `WithChildTimeout`, `WithChildAuthenticatedUser` | render children: scheduling + durable deadline + auth metadata |
 | `WithChildPartitionKey`, `WithChildDelay` | delivery children: routed to per-region partitions, started DELAYED |
-| `duro.Context` + `RunAll` | `RenderImage` — a hand-written workflow whose body is dbos-free |
+| `duro.RegisterWorkflow` + `duro.Context` + `RunAll` | `RenderImage` — hand-written, registered, and fanned out with zero dbos imports |
 | `Parallel` | the three sizes render concurrently in-process, bounded to 2, one checkpointed step each |
 
 ## Reading the output
@@ -39,20 +39,23 @@ a child of its own — renders now that no duplicate is active. Deduplication
 is a *concurrency* collapse; idempotent IDs are a *history* collapse. The two
 compose, and this run shows the seam between them.
 
-## The hand-written boundary
+## The hand-written workflow
 
 `RenderImage` is a plain workflow function — `func(ctx duro.Context, img
 Image) (Rendered, error)` — because sometimes you want imperative code around
-a pipeline. Its body stays dbos-free (`duro.Context` is an alias for DBOS's
-context; `RunAll` returns every emitted value). Registration is the one place
-the dbos package appears, in `main.go`:
+a pipeline (`RunAll` here returns every emitted value for post-processing).
+It registers like everything else, and the result is a `WorkflowRef` that
+`FanOut` accepts directly:
 
 ```go
-dbos.RegisterWorkflow(app.Context(), RenderImage, dbos.WithWorkflowName("RenderImage"))
+render := duro.RegisterWorkflow(app, "RenderImage", RenderImage)
+...
+duro.FanOut("render", renderQueue, render, ...)
 ```
 
-Registered pipelines (`duro.Register`) never need this — prefer them unless
-you need imperative control flow around the pipeline.
+Prefer registered pipelines (`duro.Register`) unless you need imperative
+control flow the pipeline shape cannot express — branching between
+pipelines, loops, or reshaping a `RunAll` result.
 
 ## Things to try
 

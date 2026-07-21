@@ -45,6 +45,44 @@ func (w *PipelineWorkflow[P, R]) runOptions() []dbos.WorkflowOption {
 // again. Every other dbos.WorkflowOption passes through Start unchanged.
 func WithWorkflowID(id string) dbos.WorkflowOption { return dbos.WithWorkflowID(id) }
 
+// RegisteredWorkflow is a hand-written workflow function registered under a
+// durable name; see RegisterWorkflow. It is a WorkflowRef, so it passes
+// directly as a FanOut child.
+type RegisteredWorkflow[P, R any] struct {
+	name string
+	wf   WorkflowFunc[P, R]
+}
+
+// dbosWorkflow and runOptions implement WorkflowRef.
+func (w *RegisteredWorkflow[P, R]) dbosWorkflow() WorkflowFunc[P, R]  { return w.wf }
+func (w *RegisteredWorkflow[P, R]) runOptions() []dbos.WorkflowOption { return nil }
+
+// Start runs (or, with dbos.WithQueue, enqueues) the workflow and returns
+// its handle. It accepts any dbos.WorkflowOption, like PipelineWorkflow's
+// Start.
+func (w *RegisteredWorkflow[P, R]) Start(ctx Context, in P, opts ...dbos.WorkflowOption) (Handle[R], error) {
+	return newHandle(dbos.RunWorkflow(unwrapContext(ctx), w.wf, in, opts...))
+}
+
+// RegisterWorkflow registers a hand-written workflow function under the given
+// name. Reach for it only when a workflow needs imperative control flow
+// around its pipelines — branching between them, looping, post-processing a
+// RunAll — since Register covers pipelines themselves. Call it before
+// Launch; the name is the workflow's durable identity, so register the same
+// function under the same name on every process start. Workflow-level
+// registration options pass through opts.
+func RegisterWorkflow[P, R any](ctx Context, name string, fn WorkflowFunc[P, R], opts ...dbos.WorkflowRegistrationOption) *RegisteredWorkflow[P, R] {
+	if name == "" {
+		panic("duro: RegisterWorkflow requires a non-empty workflow name")
+	}
+	if fn == nil {
+		panic(fmt.Sprintf("duro: RegisterWorkflow %q requires a non-nil workflow function", name))
+	}
+	dbos.RegisterWorkflow(unwrapContext(ctx), fn,
+		append([]dbos.WorkflowRegistrationOption{dbos.WithWorkflowName(name)}, opts...)...)
+	return &RegisteredWorkflow[P, R]{name: name, wf: fn}
+}
+
 // Start runs (or, with dbos.WithQueue, enqueues) the pipeline as a durable
 // workflow and returns its handle. It accepts any dbos.WorkflowOption —
 // workflow ID, queue, priority, deduplication, auth. For a durable deadline,
