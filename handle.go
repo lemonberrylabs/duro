@@ -36,10 +36,14 @@ func (h Handle[R]) Result() (R, error) {
 	return h.h.GetResult()
 }
 
-// Status returns the run's current status record.
-func (h Handle[R]) Status() (dbos.WorkflowStatus, error) {
+// Status returns the run's current status.
+func (h Handle[R]) Status() (RunStatus, error) {
 	if h.h == nil {
-		return dbos.WorkflowStatus{}, errors.New("duro: empty handle")
+		return RunStatus{}, errors.New("duro: empty handle")
 	}
-	return h.h.GetStatus()
+	s, err := h.h.GetStatus()
+	if err != nil {
+		return RunStatus{}, err
+	}
+	return runStatusOf(s), nil
 }

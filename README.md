@@ -379,6 +379,29 @@ recovered by looking it up, so register the same name on every process start.
 registered and warns about each one — a renamed pipeline is a startup warning,
 not a silent recovery failure.
 
+### Checking on runs
+
+Persist a run's workflow ID and reconcile it later from any process — the
+check-on-read pattern — with duro-owned types, no Handle required:
+
+```go
+status, err := duro.Status(app, runID) // errors.Is(err, duro.ErrRunNotFound) for unknown IDs
+switch {
+case status.State.Failed():   // error | cancelled | retries_exceeded
+	markFailed(record, status.Err) // the recorded failure reason, always non-nil when Failed
+case status.State.Terminal(): // success
+	markDone(record)
+default:                      // pending | enqueued | delayed
+	// still working
+}
+```
+
+`Status` never loads run payloads (failure reasons for failed runs are
+fetched in a scoped second query), so it is safe to poll. `StatusAll(app,
+ids...)` is the batch form; `duro.Attach[R](app, runID)` reconnects a
+restarted process to a live handle so it can await the result, not just
+poll. `Handle.Status()` returns the same `RunStatus`.
+
 ### Forking from a stage
 
 `ForkFromStage` restarts an existing run from a named stage: earlier stages
