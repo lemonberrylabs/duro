@@ -1071,9 +1071,11 @@ func TestDelayDurableSleep(t *testing.T) {
 	}
 
 	// Fork past the sleep slot (0 shape, 1 pre, 2 sleep, 3 post): the sleep
-	// replays from its checkpoint, so the fork must complete far faster than
-	// the sleep duration while re-executing only the post step.
-	start = time.Now()
+	// replays from its checkpoint, so the fork's execution must be far
+	// shorter than the sleep duration while re-executing only the post step.
+	// Measured from the run's own start/completion timestamps: forked runs
+	// dispatch through the internal queue, and wall clock would fold queue
+	// latency into the measurement (it flaked CI at 2.007s vs a 2s bound).
 	handle, err := dbos.ForkWorkflow[int](dctx, dbos.ForkWorkflowInput{
 		OriginalWorkflowID: wfID,
 		StartStep:          3,
@@ -1085,12 +1087,18 @@ func TestDelayDurableSleep(t *testing.T) {
 	if err != nil {
 		t.Fatalf("forked workflow failed: %v", err)
 	}
-	forkElapsed := time.Since(start)
 	if forked != result {
 		t.Errorf("forked result = %d, want %d", forked, result)
 	}
-	if forkElapsed >= delayDuration {
-		t.Errorf("fork replay took %v, want < %v (sleep re-executed instead of replayed)", forkElapsed, delayDuration)
+	forkStatus, err := handle.GetStatus()
+	if err != nil {
+		t.Fatalf("forked status: %v", err)
+	}
+	if forkStatus.StartedAt.IsZero() || forkStatus.CompletedAt.IsZero() {
+		t.Fatalf("forked run timestamps = started %v / completed %v, want both set", forkStatus.StartedAt, forkStatus.CompletedAt)
+	}
+	if execTime := forkStatus.CompletedAt.Sub(forkStatus.StartedAt); execTime >= delayDuration {
+		t.Errorf("fork executed for %v, want < %v (sleep re-executed instead of replayed)", execTime, delayDuration)
 	}
 	if pre, post := delayPreRuns.Load(), delayPostRuns.Load(); pre != 1 || post != 2 {
 		t.Errorf("pre/post executions = %d/%d, want 1/2 (fork replays pre and sleep, re-executes post)", pre, post)
