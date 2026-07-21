@@ -147,6 +147,11 @@ DBOS_SYSTEM_DATABASE_URL=postgres://$USER@localhost:5432/quickstart go run .
 | `duro.GetEvent(name, event, fn, timeout)` | read another workflow's `Event`; emits it | ✅ replay returns the observed value |
 | `duro.ToStream(name, stream)` | append items to a typed durable `Stream`, closed at completion | ✅ checkpointed |
 | `duro.FromStream(name, stream, fn)` | drain another workflow's `Stream`; emits its values | ✅ the whole read is one checkpoint |
+| `duro.Branch(name, pred, then, els)` | route each item through one of two pipelines | ✅ the verdict is a checkpointed step |
+| `duro.Switch(name, route, When(k, p)...)` | multi-way dispatch to case pipelines | ✅ the route key is a checkpointed step |
+| `duro.Loop(name, body, until)` | repeat a pipeline until done; durable polling with `Delay` | ✅ every iteration's verdict is checkpointed |
+| `duro.Sub(name, pipeline)` | embed a pipeline as one named stage (whole-stream) | ✅ its stages checkpoint as usual |
+| `duro.Collect(name)` | fold the stream into a slice of every item | ✅ checkpointed; empty stream → empty slice |
 | `duro.Pure(name, fn)` | cheap reshaping between stages | ❌ re-executes on replay — must be deterministic and side-effect free |
 | `duro.UnsafeOperator(name, op)` | escape hatch for raw ro operators | ⚠️ you're on your own (runtime guards still apply) |
 
@@ -157,9 +162,9 @@ workflow body:
 - `duro.Run(ctx, input, pipeline)` — returns the last emitted value
 - `duro.RunAll(ctx, input, pipeline)` — returns every emitted value
 
-Hand-written workflows are declared against `duro.Context` — an alias for
-DBOS's context type, so it works with every dbos API while workflow code
-imports only duro — and registered with `duro.RegisterWorkflow`:
+For the rare logic no combinator fits (mostly interop with existing DBOS
+code), hand-written workflows are declared against `duro.Context` — an alias
+for DBOS's context type — and registered with `duro.RegisterWorkflow`:
 
 ```go
 func InvoiceWorkflow(ctx duro.Context, b Batch) (Invoice, error) {
@@ -223,6 +228,34 @@ func InvoiceWorkflow(ctx duro.Context, b Batch) (Invoice, error) {
 	))
 }
 ```
+
+### Durable control flow
+
+Branching, dispatch, and loops are stages, not hand-written code — each
+decision runs as a checkpointed step (the same mechanism `Filter` uses), so
+a recovered workflow re-reads its recorded decisions and walks the same
+stage sequence:
+
+```go
+duro.Pipe3(
+	duro.Expand("explode", explodeTickets),
+	duro.Switch("dispatch", func(_ context.Context, t Ticket) (string, error) { return t.Category, nil },
+		duro.When("billing", billingPipeline),
+		duro.When("bug", duro.Pipe1(
+			duro.Branch("urgency", isUrgent,
+				escalatePipeline, // contains a duro.Loop polling until fixed
+				filePipeline,
+			),
+		)),
+	),
+	duro.Collect[Resolution]("report"),
+)
+```
+
+Embedded pipelines fold into the shape fingerprint, so editing an arm or
+body still fails fast on replay. `Branch`/`Switch`/`Loop` apply per item;
+`Sub(name, pipeline)` embeds a segment over the whole stream (an inner
+`Reduce` folds everything). See [`examples/triage`](examples/triage).
 
 ### Parallel fan-out
 
@@ -412,6 +445,10 @@ whole feature set:
   child option (idempotent IDs, deduplication, timeouts, delays, auth), a
   hand-written child on `duro.Context` with `RunAll` and `Parallel`, and a
   registered pipeline used directly as a FanOut child.
+- [`examples/triage`](examples/triage) — **durable control flow**: Switch
+  dispatch, a nested Branch, a polling Loop, shared segments with Sub, and
+  Collect — plus the replay proof that recorded decisions drive the same
+  path.
 - [`examples/housekeeping`](examples/housekeeping) — **operations**: cron
   pipelines, debounced bursts, forking a finished run from a named stage
   after a fix, and a three-phase walkthrough of the durable-identity

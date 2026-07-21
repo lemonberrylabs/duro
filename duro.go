@@ -52,6 +52,12 @@
 // cannot drift; declare a channel with Portable() to serialize its payloads
 // in DBOS's cross-language format.
 //
+// Control flow is durable too: Branch and Switch route each item through
+// embedded pipelines by a checkpointed decision, Loop repeats a pipeline
+// until a checkpointed verdict says done, Sub embeds a pipeline as one named
+// stage, and Collect folds the stream into a slice. Embedded pipelines are
+// part of the shape fingerprint.
+//
 // Pipelines are also registrable as first-class workflows: Register names a
 // pipeline as a DBOS workflow, RegisterScheduled runs one on a cron schedule
 // (typed Pipeline[time.Time, R]), and RegisterDebounced collapses bursts of
@@ -101,10 +107,13 @@ type Stage[T, R any] struct {
 	name   string
 	kind   string
 	apply  func(ro.Observable[T]) ro.Observable[R]
-	queues []Queue // queues this stage enqueues onto (FanOut); Register auto-registers them
+	queues []Queue  // queues this stage enqueues onto (FanOut); Register auto-registers them
+	nested []string // fingerprints of embedded pipelines (Branch/Switch/Loop/Sub)
 }
 
-func (s Stage[T, R]) info() stageInfo { return stageInfo{kind: s.kind, name: s.name} }
+func (s Stage[T, R]) info() stageInfo {
+	return stageInfo{kind: s.kind, name: s.name, nested: s.nested}
+}
 
 // StepOption configures how a durable stage executes as a DBOS step.
 type StepOption func(*stepConfig)

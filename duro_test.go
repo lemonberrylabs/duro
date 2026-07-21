@@ -77,6 +77,7 @@ func TestMain(m *testing.M) {
 	// concrete context type — hand them the inner context, not the App.
 	registerOptionWorkflows(ctx)
 	registerReadSideWorkflows(ctx)
+	registerFlowWorkflows(ctx)
 	registerPipelineWorkflows(app)
 	if err := registerFanOutOptionWorkflows(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "registering fan-out option workflows: %v\n", err)

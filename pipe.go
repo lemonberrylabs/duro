@@ -16,8 +16,9 @@ type Pipeline[P, R any] struct {
 }
 
 type stageInfo struct {
-	kind string
-	name string
+	kind   string
+	name   string
+	nested []string // fingerprints of embedded pipelines, part of the shape
 }
 
 // concatQueues flattens the queues referenced by a pipeline's stages.
@@ -30,11 +31,16 @@ func concatQueues(qs ...[]Queue) []Queue {
 }
 
 // fingerprint is the pipeline's shape identity, checkpointed by Run as the
-// hidden "duro.shape" step and compared on replay.
+// hidden "duro.shape" step and compared on replay. Control-flow stages fold
+// their embedded pipelines' fingerprints in, so editing a Branch arm or Loop
+// body still trips the shape guard.
 func (p Pipeline[P, R]) fingerprint() string {
 	parts := make([]string, len(p.shape))
 	for i, s := range p.shape {
 		parts[i] = s.kind + ":" + s.name
+		if len(s.nested) > 0 {
+			parts[i] += "[" + strings.Join(s.nested, " | ") + "]"
+		}
 	}
 	return strings.Join(parts, " → ")
 }
