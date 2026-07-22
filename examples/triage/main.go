@@ -22,6 +22,7 @@ func main() {
 	}
 
 	triage := duro.Register(app, "triage", TriagePipeline)
+	guarded := duro.Register(app, "triage-guarded", GuardedTriagePipeline)
 
 	if err := app.Launch(); err != nil {
 		fatal("launching: %v", err)
@@ -35,7 +36,7 @@ func main() {
 		{ID: "t-4", Category: "bug"},
 	}
 
-	section("triage run (Switch → nested Branch → Loop, one durable workflow)")
+	section("triage run (Switch → nested Branch → Loop → Rescue, one durable workflow)")
 	handle, err := triage.Start(app, batch)
 	if err != nil {
 		fatal("starting triage: %v", err)
@@ -48,11 +49,13 @@ func main() {
 		fmt.Printf("   %s → %s\n", r.TicketID, r.Outcome)
 	}
 	fmt.Printf("   fix-service polls: %d (the urgent bug looped until fixed)\n", pollCalls.Load())
+	fmt.Printf("   loyalty attempts: %d (retries exhausted, then rescued — the refund survived)\n", loyaltyCalls.Load())
 
-	// Every routing decision and loop iteration is a checkpoint: re-running
-	// the same workflow ID replays the whole triage from Postgres.
+	// Every routing decision, loop iteration, and rescue decision is a
+	// checkpoint: re-running the same workflow ID replays the whole triage
+	// from Postgres.
 	section("replay (same run ID: decisions replay, nothing re-executes)")
-	before := pollCalls.Load()
+	beforePolls, beforeLoyalty := pollCalls.Load(), loyaltyCalls.Load()
 	replayed, err := triage.Start(app, batch, duro.WithWorkflowID(handle.ID()))
 	if err != nil {
 		fatal("replaying: %v", err)
@@ -60,7 +63,22 @@ func main() {
 	if _, err := replayed.Result(); err != nil {
 		fatal("replay failed: %v", err)
 	}
-	fmt.Printf("   fix-service polls during replay: %d\n", pollCalls.Load()-before)
+	fmt.Printf("   fix-service polls during replay: %d, loyalty attempts: %d\n",
+		pollCalls.Load()-beforePolls, loyaltyCalls.Load()-beforeLoyalty)
+
+	// A ticket with an unknown category fails the Switch. The guarded
+	// pipeline's top-level Rescue reports the failure, then rethrows it —
+	// the whole-pipeline except block.
+	section("whole-pipeline except block (report, then rethrow)")
+	poisoned, err := guarded.Start(app, []Ticket{{ID: "t-9", Category: "mystery"}})
+	if err != nil {
+		fatal("starting guarded triage: %v", err)
+	}
+	if _, err := poisoned.Result(); err != nil {
+		fmt.Printf("   run failed as it should: %v\n", err)
+	} else {
+		fatal("guarded triage unexpectedly succeeded")
+	}
 }
 
 func databaseURL() string {

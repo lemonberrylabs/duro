@@ -54,9 +54,10 @@
 //
 // Control flow is durable too: Branch and Switch route each item through
 // embedded pipelines by a checkpointed decision, Loop repeats a pipeline
-// until a checkpointed verdict says done, Sub embeds a pipeline as one named
-// stage, and Collect folds the stream into a slice. Embedded pipelines are
-// part of the shape fingerprint.
+// until a checkpointed verdict says done, Rescue intercepts an embedded
+// pipeline's failure with a checkpointed handler that swallows or rethrows
+// it, Sub embeds a pipeline as one named stage, and Collect folds the stream
+// into a slice. Embedded pipelines are part of the shape fingerprint.
 //
 // Pipelines are also registrable as first-class workflows: Register names a
 // pipeline as a DBOS workflow, RegisterScheduled runs one on a cron schedule

@@ -30,7 +30,7 @@ launch-time warning — walk it end to end:
 ```bash
 go run . -stranded=start     # 1. park a run in Recv, then exit like a crash
 go run . -stranded=renamed   # 2. register the pipeline as "welcome-v2" instead
-go run . -stranded=rescue    # 3. register "welcome" again and signal the run
+go run . -stranded=reattach  # 3. register "welcome" again and signal the run
 ```
 
 Phase 2 prints, from `app.Launch()`:
@@ -43,7 +43,7 @@ WARN duro: in-flight workflows are recorded under a name that is no longer
 
 Phase 3 re-registers the original name: recovery re-attaches the parked run,
 `Welcomes.Send` delivers the signal it was waiting for, and it completes.
-(The arc is one-shot per database — the rescued run is finished; `dropdb`/
+(The arc is one-shot per database — the reattached run is finished; `dropdb`/
 `createdb` to repeat it.)
 
 Two details worth internalizing:

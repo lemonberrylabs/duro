@@ -52,8 +52,9 @@ without writing a single line of recovery code.
   per-child queue controls — each as a small, composable surface over the
   DBOS primitive it wraps.
 - **Durable control flow** — `Branch`, `Switch`, and `Loop` make routing and
-  polling checkpointed stages instead of hand-written workflow code, and
-  `Status`/`Attach` reconcile any persisted run ID from any process.
+  polling checkpointed stages instead of hand-written workflow code, `Rescue`
+  does the same for error handling (best-effort segments, report-then-rethrow),
+  and `Status`/`Attach` reconcile any persisted run ID from any process.
 
 ## Installation
 
@@ -153,6 +154,7 @@ DBOS_SYSTEM_DATABASE_URL=postgres://$USER@localhost:5432/quickstart go run .
 | `duro.Branch(name, pred, then, els)` | route each item through one of two pipelines | ✅ the verdict is a checkpointed step |
 | `duro.Switch(name, route, When(k, p)...)` | multi-way dispatch to case pipelines | ✅ the route key is a checkpointed step |
 | `duro.Loop(name, body, until)` | repeat a pipeline until done; durable polling with `Delay` | ✅ every iteration's verdict is checkpointed |
+| `duro.Rescue(name, pipeline, handler)` | except block: intercept an embedded pipeline's failure — swallow with a fallback or rethrow | ✅ the handler is a checkpointed step |
 | `duro.Sub(name, pipeline)` | embed a pipeline as one named stage (whole-stream) | ✅ its stages checkpoint as usual |
 | `duro.Collect(name)` | fold the stream into a slice of every item | ✅ checkpointed; empty stream → empty slice |
 | `duro.Pure(name, fn)` | cheap reshaping between stages | ❌ re-executes on replay — must be deterministic and side-effect free |
@@ -255,9 +257,30 @@ duro.Pipe3(
 )
 ```
 
+Error handling is a stage too. Pipelines are fail-fast by default; `Rescue`
+scopes that policy to a segment, covering the except-block shapes that used
+to force a hand-written workflow — best-effort segments, report-then-rethrow,
+and retry-then-swallow (stage retry options compose: the handler fires only
+after the embedded stages' retries are exhausted):
+
+```go
+duro.Rescue("cover-art", coverArtPipeline, // best-effort: a failure must not kill the song
+	func(_ context.Context, song Song, cause error) (Song, error) {
+		slog.Warn("cover art failed", "song", song.ID, "cause", cause)
+		return song, nil // swallow: pass the item through without art
+	})
+```
+
+The handler runs as a checkpointed step, so effectful handlers replay
+consistently and a recovered run never flips a swallowed failure into a
+propagated one. On success the embedded emissions pass through unchanged; on
+failure partial emissions are discarded and only the handler's fallback is
+emitted. A top-level `Pipe1(Rescue("run", pipeline, reportAndRethrow))` is
+the whole-pipeline except block.
+
 Embedded pipelines fold into the shape fingerprint, so editing an arm or
-body still fails fast on replay. `Branch`/`Switch`/`Loop` apply per item;
-`Sub(name, pipeline)` embeds a segment over the whole stream (an inner
+body still fails fast on replay. `Branch`/`Switch`/`Loop`/`Rescue` apply per
+item; `Sub(name, pipeline)` embeds a segment over the whole stream (an inner
 `Reduce` folds everything). See [`examples/triage`](examples/triage).
 
 ### Parallel fan-out
@@ -472,7 +495,8 @@ whole feature set:
   hand-written child on `duro.Context` with `RunAll` and `Parallel`, and a
   registered pipeline used directly as a FanOut child.
 - [`examples/triage`](examples/triage) — **durable control flow**: Switch
-  dispatch, a nested Branch, a polling Loop, shared segments with Sub, and
+  dispatch, a nested Branch, a polling Loop, shared segments with Sub,
+  best-effort and report-then-rethrow error handling with Rescue, and
   Collect — plus the replay proof that recorded decisions drive the same
   path.
 - [`examples/housekeeping`](examples/housekeeping) — **operations**: cron

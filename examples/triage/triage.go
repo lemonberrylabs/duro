@@ -1,12 +1,15 @@
 // Package main demonstrates duro's control-flow combinators on a support
 // ticket triage pipeline: Switch dispatches by category, a nested Branch
 // escalates urgent bugs, Loop durably polls an external system, Sub reuses a
-// shared notification segment, and Collect folds the batch into a report —
-// all inside one registered pipeline, no hand-written workflow function.
+// shared notification segment, Rescue scopes error handling to a best-effort
+// segment (and to the whole pipeline), and Collect folds the batch into a
+// report — all inside one registered pipeline, no hand-written workflow
+// function.
 package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -32,6 +35,11 @@ type Resolution struct {
 // iteration count.
 var pollCalls atomic.Int64
 
+// loyaltyCalls counts loyalty-service attempts so the demo can show the
+// retry envelope exhausting before the Rescue handler fires — and staying
+// exhausted on replay.
+var loyaltyCalls atomic.Int64
+
 // --- shared segment (Sub) ----------------------------------------------------
 // notify is one pipeline segment reused by two Switch arms — embedded with
 // Sub, it stays a single named unit in each arm's shape.
@@ -50,11 +58,28 @@ func notify(outcome string) duro.Pipeline[Ticket, Resolution] {
 
 // --- the arms ----------------------------------------------------------------
 
-// billing: refund, then the shared notify segment.
-var billingArm = duro.Pipe2(
+// billing: refund, then a best-effort goodwill credit, then the shared
+// notify segment. The loyalty service is down, so the credit step burns its
+// retries and fails — and Rescue scopes fail-fast away from the segment: the
+// handler (itself a checkpointed step, so the decision replays) swallows the
+// terminal failure and the refund still notifies. Retry-then-swallow without
+// a hand-rolled retry loop.
+var loyaltyCredit = duro.Pipe1(
+	duro.Step("loyalty-credit", func(_ context.Context, t Ticket) (Ticket, error) {
+		loyaltyCalls.Add(1)
+		return t, errors.New("loyalty service: 503")
+	}, duro.WithMaxRetries(2), duro.WithBaseInterval(50*time.Millisecond)),
+)
+
+var billingArm = duro.Pipe3(
 	duro.Step("refund", func(_ context.Context, t Ticket) (Ticket, error) {
 		return t, nil // call your billing provider here
 	}),
+	duro.Rescue("credit-best-effort", loyaltyCredit,
+		func(_ context.Context, t Ticket, cause error) (Ticket, error) {
+			fmt.Printf("      [rescue] %s: skipping loyalty credit: %v\n", t.ID, cause)
+			return t, nil // pass-through swallow: a credit failure must not block the refund
+		}),
 	duro.Sub("notify-refund", notify("refunded")),
 )
 
@@ -110,4 +135,17 @@ var TriagePipeline = duro.Pipe3(
 		duro.When("spam", spamArm),
 	),
 	duro.Collect[Resolution]("report"),
+)
+
+// GuardedTriagePipeline wraps the whole triage in a top-level except block:
+// on any failure, report it where operators will see it (a progress doc, a
+// status page), then rethrow the cause unchanged — the run still fails, but
+// never silently. Because the handler is checkpointed, the report is not
+// re-sent if a recovered run replays the failure.
+var GuardedTriagePipeline = duro.Pipe1(
+	duro.Rescue("run", TriagePipeline,
+		func(_ context.Context, batch []Ticket, cause error) ([]Resolution, error) {
+			fmt.Printf("      [report] triage of %d tickets failed: %v\n", len(batch), cause)
+			return nil, cause // rethrow: a reported failure is still a failure
+		}),
 )

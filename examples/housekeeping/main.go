@@ -15,7 +15,7 @@ import (
 const welcomeRunID = "welcome-visitor"
 
 func main() {
-	stranded := flag.String("stranded", "", "durable-identity demo phase: start | renamed | rescue (see README)")
+	stranded := flag.String("stranded", "", "durable-identity demo phase: start | renamed | reattach (see README)")
 	flag.Parse()
 
 	app, err := duro.New(context.Background(), duro.Config{
@@ -57,9 +57,9 @@ func main() {
 		os.Exit(0) // skip the deferred Shutdown: a graceful drain would abort the parked Recv
 	case "renamed":
 		fmt.Println("registered the pipeline as \"welcome-v2\" — the warning above is app.Launch()")
-		fmt.Println("finding the in-flight run recorded under \"welcome\". Run -stranded=rescue to fix it.")
+		fmt.Println("finding the in-flight run recorded under \"welcome\". Run -stranded=reattach to fix it.")
 		return
-	case "rescue":
+	case "reattach":
 		if err := Welcomes.Send(app, welcomeRunID, "ada"); err != nil {
 			fatal("sending welcome: %v", err)
 		}
