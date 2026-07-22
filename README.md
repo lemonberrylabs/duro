@@ -156,6 +156,7 @@ DBOS_SYSTEM_DATABASE_URL=postgres://$USER@localhost:5432/quickstart go run .
 | `duro.Loop(name, body, until)` | repeat a pipeline until done; durable polling with `Delay` | ✅ every iteration's verdict is checkpointed |
 | `duro.Rescue(name, pipeline, handler)` | except block: intercept an embedded pipeline's failure — swallow with a fallback or rethrow | ✅ the handler is a checkpointed step |
 | `duro.Sub(name, pipeline)` | embed a pipeline as one named stage (whole-stream) | ✅ its stages checkpoint as usual |
+| `duro.Via(name, pipeline)` | run an embedded pipeline for its effects — typically a fan-out — and pass the original item through | ✅ its stages checkpoint as usual |
 | `duro.Collect(name)` | fold the stream into a slice of every item | ✅ checkpointed; empty stream → empty slice |
 | `duro.Pure(name, fn)` | cheap reshaping between stages | ❌ re-executes on replay — must be deterministic and side-effect free |
 | `duro.UnsafeOperator(name, op)` | escape hatch for raw ro operators | ⚠️ you're on your own (runtime guards still apply) |
@@ -278,10 +279,25 @@ failure partial emissions are discarded and only the handler's fallback is
 emitted. A top-level `Pipe1(Rescue("run", pipeline, reportAndRethrow))` is
 the whole-pipeline except block.
 
+And state can survive a fan-out. `Via` runs an embedded pipeline — typically
+a `FanOut` of child workflows — for its effects, then emits the item it was
+given, discarding the embedded emissions (Tap is to Step what Via is to
+Sub). The shape that used to force `Run`, `RunAll`-and-discard, `Run` in an
+imperative body is one registered pipeline:
+
+```go
+duro.Pipe3(
+	duro.Sub("research", researchPipeline),      // state flows in…
+	duro.Via("process-units", unitsPipeline),    // fan-out runs; state flows on
+	duro.Sub("finalize", finalizePipeline),      // …and continues afterwards
+)
+```
+
 Embedded pipelines fold into the shape fingerprint, so editing an arm or
-body still fails fast on replay. `Branch`/`Switch`/`Loop`/`Rescue` apply per
-item; `Sub(name, pipeline)` embeds a segment over the whole stream (an inner
-`Reduce` folds everything). See [`examples/triage`](examples/triage).
+body still fails fast on replay. `Branch`/`Switch`/`Loop`/`Rescue`/`Via`
+apply per item; `Sub(name, pipeline)` embeds a segment over the whole stream
+(an inner `Reduce` folds everything). See
+[`examples/triage`](examples/triage).
 
 ### Parallel fan-out
 
@@ -496,9 +512,9 @@ whole feature set:
   registered pipeline used directly as a FanOut child.
 - [`examples/triage`](examples/triage) — **durable control flow**: Switch
   dispatch, a nested Branch, a polling Loop, shared segments with Sub,
-  best-effort and report-then-rethrow error handling with Rescue, and
-  Collect — plus the replay proof that recorded decisions drive the same
-  path.
+  best-effort and report-then-rethrow error handling with Rescue, an
+  archive fan-out threaded past with Via, and Collect — plus the replay
+  proof that recorded decisions drive the same path.
 - [`examples/housekeeping`](examples/housekeeping) — **operations**: cron
   pipelines, debounced bursts, forking a finished run from a named stage
   after a fix, and a three-phase walkthrough of the durable-identity

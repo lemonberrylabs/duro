@@ -67,7 +67,7 @@ Single flat package at the repo root:
   `Reduce`/`Pure`/`UnsafeOperator`), step options (retries, timeout)
 - `pipe.go` — `Pipe1`…`Pipe8` → `Pipeline[P, R]`
 - `run.go` — `Run`/`RunAll`, the hidden `duro.shape` checkpoint
-- `flow.go` — control flow: `Branch`/`Switch`/`When`/`Loop`/`Rescue`/`Sub`/`Collect`
+- `flow.go` — control flow: `Branch`/`Switch`/`When`/`Loop`/`Rescue`/`Sub`/`Via`/`Collect`
 - `fanout.go`, `parallel.go`, `queue.go` — `FanOut` + child options, `Parallel`, `NewQueue`
 - `channels.go`, `signals.go` — typed `Topic`/`Event`/`Stream`; `Delay`/`Send`/
   `Recv`/`SetEvent`/`GetEvent`/`ToStream`/`FromStream`
@@ -88,8 +88,8 @@ Single flat package at the repo root:
 - A registered pipeline's name is its **durable identity** — renaming strands
   in-flight runs (`app.Launch()` warns about them). Same name must be
   registered on every process start.
-- Embedded pipelines (`Branch`/`Switch`/`Loop`/`Rescue`/`Sub` arms) fold into
-  the shape fingerprint — editing an arm changes the fingerprint.
+- Embedded pipelines (`Branch`/`Switch`/`Loop`/`Rescue`/`Sub`/`Via` arms)
+  fold into the shape fingerprint — editing an arm changes the fingerprint.
 - `go build` in `examples/` drops binaries (e.g. `housekeeping`) — don't
   commit them.
 - Open an issue before behavior changes or new primitives (per CONTRIBUTING.md).

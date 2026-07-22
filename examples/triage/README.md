@@ -19,6 +19,7 @@ go run .    # or: DBOS_SYSTEM_DATABASE_URL=... go run .
 | `Rescue` (best-effort segment) | the billing arm's loyalty credit retries (`WithMaxRetries`), then the handler swallows the terminal failure — the refund must not die for a goodwill credit |
 | `Rescue` (whole-pipeline except block) | `GuardedTriagePipeline` wraps the entire triage: report the failure, then rethrow it |
 | `Sub` | one shared `notify` segment reused by three arms under different names |
+| `Via` | each resolution fans out to two archive systems as child workflows on a queue; the filings' results are discarded and the resolution flows on to the report |
 | `Collect` | the batch folds into a report of every resolution, in order |
 
 ## How this stays replay-deterministic
@@ -40,7 +41,8 @@ shape-mismatch error instead of misreading checkpoints.
 
 ## When you still want a hand-written workflow
 
-These combinators cover routing, iteration, composition, and error handling.
+These combinators cover routing, iteration, composition, error handling, and
+— with `Via` — carrying state past a fan-out whose results you don't need.
 What's left for `duro.RegisterWorkflow` + imperative code is genuinely
 irreducible glue: interop with existing DBOS codebases, or logic that doesn't
 fit a dataflow shape at all.

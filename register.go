@@ -42,8 +42,8 @@ func (w *PipelineWorkflow[P, R]) runOptions() []dbos.WorkflowOption {
 
 // WithWorkflowID assigns a run's workflow ID — the standard idempotency key:
 // starting the same ID twice re-attaches to the first run instead of running
-// again. Every other dbos.WorkflowOption passes through Start unchanged.
-func WithWorkflowID(id string) dbos.WorkflowOption { return dbos.WithWorkflowID(id) }
+// again. Every other WorkflowOption passes through Start unchanged.
+func WithWorkflowID(id string) WorkflowOption { return dbos.WithWorkflowID(id) }
 
 // RegisteredWorkflow is a hand-written workflow function registered under a
 // durable name; see RegisterWorkflow. It is a WorkflowRef, so it passes
@@ -58,9 +58,8 @@ func (w *RegisteredWorkflow[P, R]) dbosWorkflow() WorkflowFunc[P, R]  { return w
 func (w *RegisteredWorkflow[P, R]) runOptions() []dbos.WorkflowOption { return nil }
 
 // Start runs (or, with dbos.WithQueue, enqueues) the workflow and returns
-// its handle. It accepts any dbos.WorkflowOption, like PipelineWorkflow's
-// Start.
-func (w *RegisteredWorkflow[P, R]) Start(ctx Context, in P, opts ...dbos.WorkflowOption) (Handle[R], error) {
+// its handle. It accepts any WorkflowOption, like PipelineWorkflow's Start.
+func (w *RegisteredWorkflow[P, R]) Start(ctx Context, in P, opts ...WorkflowOption) (Handle[R], error) {
 	return newHandle(dbos.RunWorkflow(unwrapContext(ctx), w.wf, in, opts...))
 }
 
@@ -71,7 +70,7 @@ func (w *RegisteredWorkflow[P, R]) Start(ctx Context, in P, opts ...dbos.Workflo
 // Launch; the name is the workflow's durable identity, so register the same
 // function under the same name on every process start. Workflow-level
 // registration options pass through opts.
-func RegisterWorkflow[P, R any](ctx Context, name string, fn WorkflowFunc[P, R], opts ...dbos.WorkflowRegistrationOption) *RegisteredWorkflow[P, R] {
+func RegisterWorkflow[P, R any](ctx Context, name string, fn WorkflowFunc[P, R], opts ...WorkflowRegistrationOption) *RegisteredWorkflow[P, R] {
 	if name == "" {
 		panic("duro: RegisterWorkflow requires a non-empty workflow name")
 	}
@@ -84,10 +83,10 @@ func RegisterWorkflow[P, R any](ctx Context, name string, fn WorkflowFunc[P, R],
 }
 
 // Start runs (or, with dbos.WithQueue, enqueues) the pipeline as a durable
-// workflow and returns its handle. It accepts any dbos.WorkflowOption —
-// workflow ID, queue, priority, deduplication, auth. For a durable deadline,
-// pass a context derived with dbos.WithTimeout.
-func (w *PipelineWorkflow[P, R]) Start(ctx Context, in P, opts ...dbos.WorkflowOption) (Handle[R], error) {
+// workflow and returns its handle. It accepts any WorkflowOption — workflow
+// ID, queue, priority, deduplication, auth. For a durable deadline, pass a
+// context derived with dbos.WithTimeout.
+func (w *PipelineWorkflow[P, R]) Start(ctx Context, in P, opts ...WorkflowOption) (Handle[R], error) {
 	return newHandle(dbos.RunWorkflow(unwrapContext(ctx), w.wf, in, append(opts, dbos.WithRunInstance(w))...))
 }
 
@@ -99,7 +98,7 @@ func (w *PipelineWorkflow[P, R]) Start(ctx Context, in P, opts ...dbos.WorkflowO
 // The name is the pipeline's durable identity: in-flight runs are recovered
 // by looking it up, so it must be registered on every process start. Launch
 // warns about runs whose name is no longer registered.
-func Register[P, R any](ctx Context, name string, p Pipeline[P, R], opts ...dbos.WorkflowRegistrationOption) *PipelineWorkflow[P, R] {
+func Register[P, R any](ctx Context, name string, p Pipeline[P, R], opts ...WorkflowRegistrationOption) *PipelineWorkflow[P, R] {
 	mustValidPipelineWorkflow("Register", name, p)
 	ctx = unwrapContext(ctx)
 	for _, q := range p.queues {
@@ -119,7 +118,7 @@ func Register[P, R any](ctx Context, name string, p Pipeline[P, R], opts ...dbos
 // schedule uses cron syntax with seconds precision ("*/30 * * * * *" = every
 // 30 seconds). Requiring Pipeline[time.Time, R] makes the DBOS rule that
 // scheduled workflows take a time.Time input a compile-time guarantee.
-func RegisterScheduled[R any](ctx Context, name, cronSchedule string, p Pipeline[time.Time, R], opts ...dbos.WorkflowRegistrationOption) *PipelineWorkflow[time.Time, R] {
+func RegisterScheduled[R any](ctx Context, name, cronSchedule string, p Pipeline[time.Time, R], opts ...WorkflowRegistrationOption) *PipelineWorkflow[time.Time, R] {
 	if cronSchedule == "" {
 		panic(fmt.Sprintf("duro: RegisterScheduled %q requires a cron schedule", name))
 	}

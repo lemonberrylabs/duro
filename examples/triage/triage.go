@@ -2,9 +2,10 @@
 // ticket triage pipeline: Switch dispatches by category, a nested Branch
 // escalates urgent bugs, Loop durably polls an external system, Sub reuses a
 // shared notification segment, Rescue scopes error handling to a best-effort
-// segment (and to the whole pipeline), and Collect folds the batch into a
-// report — all inside one registered pipeline, no hand-written workflow
-// function.
+// segment (and to the whole pipeline), Via fans each resolution out to
+// archive systems and passes the resolution through, and Collect folds the
+// batch into a report — all inside one registered pipeline, no hand-written
+// workflow function.
 package main
 
 import (
@@ -121,9 +122,47 @@ var spamArm = duro.Pipe1(
 	}),
 )
 
+// --- the archive fan-out (Via) -----------------------------------------------
+// Every resolution is archived to two compliance systems, each filing a child
+// workflow on a queue. The filings' outcomes are not the stream — the
+// resolution is: Via runs the embedded fan-out for its effects and passes the
+// resolution through to the report. Before Via, this shape was the last
+// reason to hand-write a workflow function: run the fan-out with RunAll,
+// discard its results, continue with the value you had before it.
+
+// ArchiveJob is the FanOut child input: one filing per (system, resolution).
+type ArchiveJob struct {
+	System   string
+	TicketID string
+	Outcome  string
+}
+
+var archiveQueue = duro.NewQueue("triage-archive", duro.WithConcurrency(2))
+
+// archiveRuns counts child filings so the demo can show the fan-out ran (and
+// replays for free).
+var archiveRuns atomic.Int64
+
+// ArchiveResolution is the FanOut child workflow: one durable filing per
+// system. Registered in main.go; referenced here via duro.Workflow.
+func ArchiveResolution(_ duro.Context, job ArchiveJob) (string, error) {
+	archiveRuns.Add(1)
+	return job.System + ":" + job.TicketID, nil
+}
+
+var archiveTrail = duro.Pipe2(
+	duro.Expand("systems", func(_ context.Context, r Resolution) ([]ArchiveJob, error) {
+		return []ArchiveJob{
+			{System: "warehouse", TicketID: r.TicketID, Outcome: r.Outcome},
+			{System: "legal-hold", TicketID: r.TicketID, Outcome: r.Outcome},
+		}, nil
+	}),
+	duro.FanOut("file", archiveQueue, duro.Workflow(ArchiveResolution)),
+)
+
 // --- the pipeline ------------------------------------------------------------
 
-var TriagePipeline = duro.Pipe3(
+var TriagePipeline = duro.Pipe4(
 	duro.Expand("explode", func(_ context.Context, ts []Ticket) ([]Ticket, error) {
 		return ts, nil
 	}),
@@ -134,6 +173,7 @@ var TriagePipeline = duro.Pipe3(
 		duro.When("bug", bugArm),
 		duro.When("spam", spamArm),
 	),
+	duro.Via("archive-trail", archiveTrail),
 	duro.Collect[Resolution]("report"),
 )
 

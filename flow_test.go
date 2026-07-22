@@ -343,6 +343,114 @@ func rescueParallelWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
 	))
 }
 
+var (
+	viaEffectRuns      atomic.Int64
+	viaAfterStageRuns  atomic.Int64
+	viaFanChildRuns    atomic.Int64
+	viaRescuedPostRuns atomic.Int64
+)
+
+// viaPassThroughWorkflow routes each item through a Via whose embedded
+// pipeline emits zero, one, or many values depending on the item — the
+// original item must come out the other side in every case.
+func viaPassThroughWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+	effects := duro.Pipe2(
+		// 0 → drop (zero emissions), 1 → [v] (one), 2 → [v, v] (many).
+		duro.Expand("fan", func(_ context.Context, v int) ([]int, error) {
+			outs := make([]int, v%3)
+			for i := range outs {
+				outs[i] = v * 100 // values that must NOT appear downstream
+			}
+			return outs, nil
+		}),
+		duro.Tap("effect", func(_ context.Context, _ int) error {
+			viaEffectRuns.Add(1)
+			return nil
+		}),
+	)
+	return duro.Run(ctx, ns, duro.Pipe3(
+		duro.Expand("explode", explode),
+		duro.Via("side-quest", effects),
+		duro.Collect[int]("collect"),
+	))
+}
+
+// viaFailureWorkflow fails inside the Via's embedded pipeline on item 2:
+// the outer pipeline must fail fast and the stage after the Via must never
+// run for items behind the failure.
+func viaFailureWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+	boom := duro.Pipe1(duro.Tap("boom", func(_ context.Context, v int) error {
+		if v == 2 {
+			return errors.New("boom: two is forbidden")
+		}
+		return nil
+	}))
+	return duro.Run(ctx, ns, duro.Pipe4(
+		duro.Expand("explode", explode),
+		duro.Via("side-quest", boom),
+		duro.Step("after", func(_ context.Context, v int) (int, error) {
+			viaAfterStageRuns.Add(1)
+			return v, nil
+		}),
+		duro.Collect[int]("collect"),
+	))
+}
+
+// viaRescuedWorkflow composes the best-effort fan-out shape:
+// Rescue(Pipe1(Via(...))) continues with the original item whether the
+// embedded effects succeeded or failed.
+func viaRescuedWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+	boom := duro.Pipe1(duro.Tap("boom", func(_ context.Context, v int) error {
+		if v == 2 {
+			return errors.New("boom: two is forbidden")
+		}
+		return nil
+	}))
+	return duro.Run(ctx, ns, duro.Pipe4(
+		duro.Expand("explode", explode),
+		duro.Rescue("best-effort", duro.Pipe1(duro.Via("side-quest", boom)),
+			func(_ context.Context, in int, _ error) (int, error) {
+				return in, nil // the original item continues either way
+			}),
+		duro.Step("post", func(_ context.Context, v int) (int, error) {
+			viaRescuedPostRuns.Add(1)
+			return v, nil
+		}),
+		duro.Collect[int]("collect"),
+	))
+}
+
+// viaFanChildLog is the child workflow for the Via+FanOut test; the parent
+// discards its results, so it only counts executions.
+func viaFanChildLog(_ dbos.DBOSContext, n int) (int, error) {
+	viaFanChildRuns.Add(1)
+	return n, nil
+}
+
+// viaFanQueue is only referenced inside a Via-embedded pipeline; registering
+// the pipeline must still auto-register it.
+var viaFanQueue = duro.NewQueue("duro-test-via-fan", duro.WithConcurrency(2))
+
+var viaFanWf *duro.PipelineWorkflow[[]int, []int]
+
+// includeExtraViaStage simulates editing a Via's embedded pipeline between
+// the original run and a replay, for the shape-guard test.
+var includeExtraViaStage = false
+
+func mutableViaWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
+	effects := duro.Pipe1(duro.Tap("noop", func(_ context.Context, _ int) error { return nil }))
+	if includeExtraViaStage {
+		effects = duro.Pipe2(
+			duro.Tap("noop", func(_ context.Context, _ int) error { return nil }),
+			duro.Tap("extra", func(_ context.Context, _ int) error { return nil }),
+		)
+	}
+	return duro.Run(ctx, n, duro.Pipe2(
+		duro.Via("side-quest", effects),
+		duro.Step("double", func(_ context.Context, v int) (int, error) { return v * 2, nil }),
+	))
+}
+
 // flowQueue is only referenced inside a Branch arm; registering the pipeline
 // must still auto-register it.
 var flowQueue = duro.NewQueue("duro-test-flow", duro.WithConcurrency(2))
@@ -367,6 +475,11 @@ func registerFlowWorkflows(ctx dbos.DBOSContext) {
 	dbos.RegisterWorkflow(ctx, rescueCrashWorkflow, dbos.WithWorkflowName("rescueCrashWorkflow"))
 	dbos.RegisterWorkflow(ctx, rescueParallelWorkflow, dbos.WithWorkflowName("rescueParallelWorkflow"))
 	dbos.RegisterWorkflow(ctx, fanChildSquareOrFail, dbos.WithWorkflowName("fanChildSquareOrFail"))
+	dbos.RegisterWorkflow(ctx, viaPassThroughWorkflow, dbos.WithWorkflowName("viaPassThroughWorkflow"))
+	dbos.RegisterWorkflow(ctx, viaFailureWorkflow, dbos.WithWorkflowName("viaFailureWorkflow"))
+	dbos.RegisterWorkflow(ctx, viaRescuedWorkflow, dbos.WithWorkflowName("viaRescuedWorkflow"))
+	dbos.RegisterWorkflow(ctx, mutableViaWorkflow, dbos.WithWorkflowName("mutableViaWorkflow"))
+	dbos.RegisterWorkflow(ctx, viaFanChildLog, dbos.WithWorkflowName("viaFanChildLog"))
 
 	flowQueueWf = duro.Register(app, "flowQueuePipeline", duro.Pipe3(
 		duro.Expand("explode", explode),
@@ -383,6 +496,12 @@ func registerFlowWorkflows(ctx dbos.DBOSContext) {
 			func(_ context.Context, in int, _ error) (int, error) {
 				return in, nil // pass-through swallow: keep the failed child's item as-is
 			}),
+		duro.Collect[int]("collect"),
+	))
+
+	viaFanWf = duro.Register(app, "viaFanPipeline", duro.Pipe3(
+		duro.Expand("explode", explode),
+		duro.Via("notify-all", duro.Pipe1(duro.FanOut("fan", viaFanQueue, duro.Workflow(viaFanChildLog)))),
 		duro.Collect[int]("collect"),
 	))
 }
@@ -553,6 +672,12 @@ func TestFlowConstructionPanics(t *testing.T) {
 		duro.Rescue("r", duro.Pipeline[int, int]{}, func(_ context.Context, v int, _ error) (int, error) {
 			return v, nil
 		})
+	})
+	assertPanics(t, "Via empty name", func() {
+		duro.Via("", valid)
+	})
+	assertPanics(t, "Via zero-value pipeline", func() {
+		duro.Via("v", duro.Pipeline[int, int]{})
 	})
 }
 
@@ -788,4 +913,114 @@ func TestRescueEmbeddedParallel(t *testing.T) {
 	// 1 spreads to [1,2,3] and squares; -2's fleet contains negatives and is
 	// rescued to the item itself; 3 spreads to [3,4,5] and squares.
 	assertInts(t, result, []int{1, 4, 9, -2, 9, 16, 25})
+}
+
+// TestViaPassesItemThrough proves Via emits the original item whether the
+// embedded pipeline emitted zero, one, or many values — and that Via records
+// no step of its own: the recorded sequence is exactly the embedded stages'.
+func TestViaPassesItemThrough(t *testing.T) {
+	viaEffectRuns.Store(0)
+
+	// v%3 embedded emissions per item: 3 → zero, 4 → one, 5 → two.
+	result, wfID := mustRun(t, viaPassThroughWorkflow, []int{3, 4, 5})
+	assertInts(t, result, []int{3, 4, 5}) // the originals — never the embedded 100s
+	if got := viaEffectRuns.Load(); got != 3 {
+		t.Errorf("embedded effect executions = %d, want 3 (0+1+2)", got)
+	}
+	assertNames(t, stepNames(t, wfID), []string{
+		duro.ShapeStepName, "explode",
+		"fan", "collect", // item 3: embedded pipeline emitted nothing
+		"fan", "effect", "collect", // item 4
+		"fan", "effect", "effect", "collect", // item 5
+	})
+}
+
+// TestViaFailurePropagates proves an embedded failure is fail-fast and
+// unscoped: the outer pipeline fails with it and stages behind the failure
+// never run.
+func TestViaFailurePropagates(t *testing.T) {
+	viaAfterStageRuns.Store(0)
+
+	handle, err := dbos.RunWorkflow(dctx, viaFailureWorkflow, []int{1, 2, 3})
+	if err != nil {
+		t.Fatalf("starting workflow: %v", err)
+	}
+	_, err = handle.GetResult()
+	if err == nil || !strings.Contains(err.Error(), "two is forbidden") {
+		t.Fatalf("workflow error = %v, want the embedded failure", err)
+	}
+	// Item 1 passed the Via, item 2 failed inside it, item 3 must never run.
+	if got := viaAfterStageRuns.Load(); got != 1 {
+		t.Errorf("after-stage executions = %d, want 1 (only item 1)", got)
+	}
+}
+
+// TestViaRescuedContinues proves the best-effort fan-out composition:
+// Rescue(Pipe1(Via(...))) continues with the original item whether the
+// embedded effects succeeded or failed.
+func TestViaRescuedContinues(t *testing.T) {
+	viaRescuedPostRuns.Store(0)
+
+	result, _ := mustRun(t, viaRescuedWorkflow, []int{1, 2, 3})
+	assertInts(t, result, []int{1, 2, 3})
+	if got := viaRescuedPostRuns.Load(); got != 3 {
+		t.Errorf("post executions = %d, want 3 (the rescued item and the items behind it)", got)
+	}
+}
+
+// TestViaEmbeddedFanOut proves the flagship use: children fan out on a queue
+// referenced only inside the Via (still auto-registered), complete before the
+// original items are emitted, and a rerun of the same workflow ID re-attaches
+// to them instead of re-running.
+func TestViaEmbeddedFanOut(t *testing.T) {
+	viaFanChildRuns.Store(0)
+	const wfID = "via-fanout-rerun"
+
+	handle, err := viaFanWf.Start(app, []int{7, 8}, duro.WithWorkflowID(wfID))
+	if err != nil {
+		t.Fatalf("starting pipeline: %v", err)
+	}
+	result, err := handle.Result()
+	if err != nil {
+		t.Fatalf("pipeline failed: %v", err)
+	}
+	assertInts(t, result, []int{7, 8}) // the originals, not the children's results
+	if got := viaFanChildRuns.Load(); got != 2 {
+		t.Fatalf("child executions = %d, want 2", got)
+	}
+
+	rerun, err := viaFanWf.Start(app, []int{7, 8}, duro.WithWorkflowID(wfID))
+	if err != nil {
+		t.Fatalf("re-starting pipeline: %v", err)
+	}
+	replayed, err := rerun.Result()
+	if err != nil {
+		t.Fatalf("replay failed: %v", err)
+	}
+	assertInts(t, replayed, result)
+	if got := viaFanChildRuns.Load(); got != 2 {
+		t.Errorf("child executions after rerun = %d, want 2 (re-attached, not re-run)", got)
+	}
+}
+
+// TestViaShapeGuard proves the embedded pipeline is part of the shape:
+// editing it between run and replay trips the shape-mismatch guard.
+func TestViaShapeGuard(t *testing.T) {
+	includeExtraViaStage = false
+	result, wfID := mustRun(t, mutableViaWorkflow, 21)
+	if result != 42 {
+		t.Fatalf("result = %d, want 42", result)
+	}
+
+	includeExtraViaStage = true
+	defer func() { includeExtraViaStage = false }()
+
+	handle, err := duro.ForkFromStage[int](app, duro.Fork{WorkflowID: wfID, Stage: "double"})
+	if err != nil {
+		t.Fatalf("forking: %v", err)
+	}
+	_, err = handle.Result()
+	if err == nil || !strings.Contains(err.Error(), "pipeline shape mismatch") {
+		t.Fatalf("forked workflow error = %v, want a pipeline shape mismatch", err)
+	}
 }

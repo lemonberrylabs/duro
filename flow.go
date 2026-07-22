@@ -276,6 +276,40 @@ func Sub[T, R any](name string, p Pipeline[T, R]) Stage[T, R] {
 	return Stage[T, R]{name: name, kind: "sub", nested: []string{p.fingerprint()}, queues: p.queues, apply: p.apply}
 }
 
+// Via runs the embedded pipeline for each item — durably, to completion —
+// then emits the ORIGINAL item downstream, discarding the embedded
+// pipeline's emissions. Tap is to Step what Via is to Sub: the embedded
+// pipeline exists for its effects (typically a FanOut of child workflows or
+// a Parallel fleet), not its outputs, and the item that entered continues on
+// afterwards. That is what lets a pipeline whose state must survive a
+// fan-out stay a single registered pipeline instead of a hand-written
+// workflow around several Run calls.
+//
+// Via never drops items: a successful embedded run that emits nothing (a
+// Filter dropped everything) still passes the original item through —
+// embedded emissions are ignored entirely, zero included. This is the
+// deliberate contrast with Sub, whose emissions ARE the stream. The
+// re-emitted item is replay-stable because it came from upstream
+// checkpoints; Via itself records no step.
+//
+// An embedded failure fails the outer pipeline exactly like any stage
+// failure — partial embedded effects before it remain checkpointed. Wrap in
+// Rescue to swallow: Rescue(name, Pipe1(Via(...)), handler) is a best-effort
+// fan-out that continues with the original item either way. Applied per item
+// on multi-item streams, in stream order.
+func Via[T, R any](name string, p Pipeline[T, R]) Stage[T, T] {
+	if name == "" {
+		panic("duro: Via stage requires a non-empty name")
+	}
+	mustValidEmbedded("Via", name, p)
+	return Stage[T, T]{name: name, kind: "via", nested: []string{p.fingerprint()}, queues: p.queues, apply: ro.FlatMapWithContext(func(ctx context.Context, in T) ro.Observable[T] {
+		if _, err := collectSub(ctx, p, in); err != nil {
+			return ro.Throw[T](err)
+		}
+		return ro.Of(in)
+	})}
+}
+
 // Collect folds the stream into a slice of every item, in order — the
 // standard final stage for a registered pipeline that should return all
 // values rather than the last one. An empty stream yields an empty slice.

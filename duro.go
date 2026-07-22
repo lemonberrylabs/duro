@@ -56,8 +56,9 @@
 // embedded pipelines by a checkpointed decision, Loop repeats a pipeline
 // until a checkpointed verdict says done, Rescue intercepts an embedded
 // pipeline's failure with a checkpointed handler that swallows or rethrows
-// it, Sub embeds a pipeline as one named stage, and Collect folds the stream
-// into a slice. Embedded pipelines are part of the shape fingerprint.
+// it, Sub embeds a pipeline as one named stage, Via runs one for its effects
+// and passes the original item through, and Collect folds the stream into a
+// slice. Embedded pipelines are part of the shape fingerprint.
 //
 // Pipelines are also registrable as first-class workflows: Register names a
 // pipeline as a DBOS workflow, RegisterScheduled runs one on a cron schedule
@@ -94,6 +95,18 @@ type Context = dbos.DBOSContext
 // RegisterWorkflow registers and Workflow adapts into a FanOut child.
 // Registered pipelines (Register) never touch this type.
 type WorkflowFunc[P, R any] = dbos.Workflow[P, R]
+
+// WorkflowOption configures how a single run starts (DBOS's option type
+// under a duro name, like Context): WithWorkflowID is the common one, and
+// any dbos.WorkflowOption works unchanged. The alias lets consumer helpers
+// name the type without importing dbos.
+type WorkflowOption = dbos.WorkflowOption
+
+// WorkflowRegistrationOption configures how a pipeline or workflow function
+// is registered (DBOS's option type under a duro name); Register and
+// RegisterWorkflow accept these. The alias lets consumer helpers name the
+// type without importing dbos.
+type WorkflowRegistrationOption = dbos.WorkflowRegistrationOption
 
 // ErrNoValue is returned by Run when the pipeline completes without emitting
 // any value (for example, when a Filter stage drops every item).

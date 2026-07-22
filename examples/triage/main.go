@@ -21,6 +21,7 @@ func main() {
 		fatal("initializing: %v", err)
 	}
 
+	duro.RegisterWorkflow(app, "ArchiveResolution", ArchiveResolution)
 	triage := duro.Register(app, "triage", TriagePipeline)
 	guarded := duro.Register(app, "triage-guarded", GuardedTriagePipeline)
 
@@ -36,7 +37,7 @@ func main() {
 		{ID: "t-4", Category: "bug"},
 	}
 
-	section("triage run (Switch → nested Branch → Loop → Rescue, one durable workflow)")
+	section("triage run (Switch → nested Branch → Loop → Rescue → Via, one durable workflow)")
 	handle, err := triage.Start(app, batch)
 	if err != nil {
 		fatal("starting triage: %v", err)
@@ -50,12 +51,13 @@ func main() {
 	}
 	fmt.Printf("   fix-service polls: %d (the urgent bug looped until fixed)\n", pollCalls.Load())
 	fmt.Printf("   loyalty attempts: %d (retries exhausted, then rescued — the refund survived)\n", loyaltyCalls.Load())
+	fmt.Printf("   archive filings: %d child workflows (Via ran the fan-out; the report still carries resolutions)\n", archiveRuns.Load())
 
 	// Every routing decision, loop iteration, and rescue decision is a
 	// checkpoint: re-running the same workflow ID replays the whole triage
 	// from Postgres.
 	section("replay (same run ID: decisions replay, nothing re-executes)")
-	beforePolls, beforeLoyalty := pollCalls.Load(), loyaltyCalls.Load()
+	beforePolls, beforeLoyalty, beforeArchives := pollCalls.Load(), loyaltyCalls.Load(), archiveRuns.Load()
 	replayed, err := triage.Start(app, batch, duro.WithWorkflowID(handle.ID()))
 	if err != nil {
 		fatal("replaying: %v", err)
@@ -63,8 +65,8 @@ func main() {
 	if _, err := replayed.Result(); err != nil {
 		fatal("replay failed: %v", err)
 	}
-	fmt.Printf("   fix-service polls during replay: %d, loyalty attempts: %d\n",
-		pollCalls.Load()-beforePolls, loyaltyCalls.Load()-beforeLoyalty)
+	fmt.Printf("   fix-service polls during replay: %d, loyalty attempts: %d, archive filings: %d\n",
+		pollCalls.Load()-beforePolls, loyaltyCalls.Load()-beforeLoyalty, archiveRuns.Load()-beforeArchives)
 
 	// A ticket with an unknown category fails the Switch. The guarded
 	// pipeline's top-level Rescue reports the failure, then rethrows it —
