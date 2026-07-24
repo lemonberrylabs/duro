@@ -78,13 +78,14 @@ func TestMain(m *testing.M) {
 	registerOptionWorkflows(ctx)
 	registerReadSideWorkflows(ctx)
 	registerFlowWorkflows(ctx)
+	registerCancelWorkflows(ctx)
 	registerPipelineWorkflows(app)
 	if err := registerFanOutOptionWorkflows(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "registering fan-out option workflows: %v\n", err)
 		os.Exit(1)
 	}
 
-	if err := duro.RegisterQueues(app, fanQueue); err != nil {
+	if err := duro.RegisterQueues(app, fanQueue, cancelWideQueue, cancelLimitedQueue); err != nil {
 		fmt.Fprintf(os.Stderr, "registering queue: %v\n", err)
 		os.Exit(1)
 	}
@@ -1051,6 +1052,9 @@ func TestParallelStepFailure(t *testing.T) {
 	_, err = handle.GetResult()
 	if err == nil || !strings.Contains(err.Error(), `stage "par"`) || !strings.Contains(err.Error(), "grumpy") {
 		t.Fatalf("workflow error = %v, want the par stage's step failure", err)
+	}
+	if got := parRuns.Load(); got != 3 {
+		t.Errorf("step executions = %d, want 3 (the default drains every step to completion despite the failure)", got)
 	}
 }
 

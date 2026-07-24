@@ -65,6 +65,7 @@ func Branch[T, R any](name string, pred func(ctx context.Context, in T) (bool, e
 // the workflow goroutine.
 func dispatchStage[T, R any](kind, name string, route func(ctx context.Context, in T) (string, error), cases []Case[T, R], opts []StepOption) Stage[T, R] {
 	mustValidStage(kind, name, route == nil)
+	resolveCancelSiblings(kind, name, opts, false)
 	if len(cases) == 0 {
 		panic(fmt.Sprintf("duro: %s stage %q requires at least one case", kind, name))
 	}
@@ -133,6 +134,7 @@ func dispatchStage[T, R any](kind, name string, route func(ctx context.Context, 
 // T and fail past a limit), or stop a runaway run with dbos.CancelWorkflow.
 func Loop[T any](name string, body Pipeline[T, T], until func(ctx context.Context, in T) (bool, error), opts ...StepOption) Stage[T, T] {
 	mustValidStage("Loop", name, until == nil)
+	resolveCancelSiblings("Loop", name, opts, false)
 	mustValidEmbedded("Loop", name, body)
 	return Stage[T, T]{name: name, kind: "loop", nested: []string{body.fingerprint()}, queues: body.queues, apply: func(source ro.Observable[T]) ro.Observable[T] {
 		return ro.NewUnsafeObservableWithContext(func(subCtx context.Context, dest ro.Observer[T]) ro.Teardown {
@@ -212,6 +214,7 @@ func Loop[T any](name string, body Pipeline[T, T], until func(ctx context.Contex
 // block.
 func Rescue[T, R any](name string, p Pipeline[T, R], handler func(ctx context.Context, in T, cause error) (R, error), opts ...StepOption) Stage[T, R] {
 	mustValidStage("Rescue", name, handler == nil)
+	resolveCancelSiblings("Rescue", name, opts, false)
 	mustValidEmbedded("Rescue", name, p)
 	return Stage[T, R]{name: name, kind: "rescue", nested: []string{p.fingerprint()}, queues: p.queues, apply: func(source ro.Observable[T]) ro.Observable[R] {
 		return ro.NewUnsafeObservableWithContext(func(subCtx context.Context, dest ro.Observer[R]) ro.Teardown {
@@ -314,6 +317,7 @@ func Via[T, R any](name string, p Pipeline[T, R]) Stage[T, T] {
 // standard final stage for a registered pipeline that should return all
 // values rather than the last one. An empty stream yields an empty slice.
 func Collect[T any](name string, opts ...StepOption) Stage[T, []T] {
+	resolveCancelSiblings("Collect", name, opts, false)
 	s := Reduce(name, func(_ context.Context, acc []T, v T) ([]T, error) {
 		return append(acc, v), nil
 	}, nil, opts...)

@@ -353,11 +353,48 @@ construction time, like every other stage validation. A registered pipeline is
 itself a valid FanOut child — pass it directly:
 `duro.FanOut("sub", Jobs, childPipeline)`.
 
+On the first child failure the stage fails with that child's error. What
+happens to the *other* children is a per-stage choice. The default is
+**drain**: siblings run to completion in the background — right when every
+completion has value on its own (cleanup and deletion fan-outs, where more
+work finishing on the failure path is strictly better). When surviving
+siblings are wasted spend once the batch's outcome is decided — cost-bearing
+generation, paid API calls — opt into **cancellation**:
+
+```go
+duro.FanOut("units", Jobs, duro.Workflow(GenerateUnit), duro.WithCancelSiblings())
+```
+
+The first failed child promptly cancels every sibling not yet in a terminal
+state, running and never-dequeued alike; detection watches all children at
+once, so an early failure in a long batch is not discovered only after the
+children ahead of it finish. The stage still fails with the triggering
+child's error — cancelled siblings never mask it, live or on recovery replay,
+so a `Rescue` around the stage always sees the original failure — and a
+parent that crashes mid-cancellation re-issues it idempotently when it
+recovers. Cancellation also survives the parent's executor: each batch gets
+duro's **cancellation watcher**, an internal durable workflow (auto-registered
+by `duro.New`) that watches the same children from its own queue and cancels
+redundantly — any executor can dequeue or recover it, so a failure is acted
+on even if the process awaiting the batch dies. The watcher is a backstop
+polling at 5s by default (`WithCancelWatchInterval` tunes it); while the
+awaiting process lives, the stage itself detects failures within 250ms. Cancel mode awaits results as one assembled step named after the
+stage (instead of one `DBOS.getResult` step per child), so the option is part
+of the shape fingerprint: toggling it while runs are in flight trips the
+shape guard rather than misreading checkpoints. Cancellation does not cascade
+to workflows a cancelled child had itself started — see the
+`WithCancelSiblings` godoc for the nested-fan-out pattern.
+
 When you don't need queue-level distribution or per-child durability,
 `duro.Parallel(name, max, fn)` is the lightweight sibling: concurrent **steps**
 inside the workflow process (built on `dbos.Go`, which pre-assigns each step's
 ID deterministically), bounded by `max`, with results in input order — no
-queue, no polling latency.
+queue, no polling latency. It drains on failure by default too;
+`duro.WithCancelSiblingSteps()` is its cancellation opt-in — in-flight
+siblings get their step contexts cancelled (the function must honor
+cancellation, the same contract as `WithTimeout`) and unstarted items skip
+the function while still occupying their deterministic step slots, keeping
+recovery replay aligned.
 
 ### Signals, events, and streams
 
@@ -508,8 +545,10 @@ whole feature set:
 - [`examples/thumbnails`](examples/thumbnails) — **fan-out fleets**: queue
   declarations (concurrency, rate limits, priorities, partitions), every
   child option (idempotent IDs, deduplication, timeouts, delays, auth), a
-  hand-written child on `duro.Context` with `RunAll` and `Parallel`, and a
-  registered pipeline used directly as a FanOut child.
+  hand-written child on `duro.Context` with `RunAll` and `Parallel`, a
+  registered pipeline used directly as a FanOut child, and a strict batch
+  whose first failure cancels the surviving fleet (`WithCancelSiblings`)
+  under a `Rescue` that sees the original error.
 - [`examples/triage`](examples/triage) — **durable control flow**: Switch
   dispatch, a nested Branch, a polling Loop, shared segments with Sub,
   best-effort and report-then-rethrow error handling with Rescue, an

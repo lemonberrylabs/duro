@@ -61,6 +61,13 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Every app carries duro's cancellation watcher (see WithCancelSiblings):
+	// watchers are queued workflows, and any executor may dequeue or recover
+	// one, so the registration must exist on every process.
+	if err := registerCancelWatcher(dctx); err != nil {
+		dctx.Shutdown(5 * time.Second)
+		return nil, err
+	}
 	return &App{DBOSContext: dctx, logger: logger}, nil
 }
 

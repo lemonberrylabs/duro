@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -79,6 +80,12 @@ var renderRuns atomic.Int64
 var renderSizes = duro.Pipe2(
 	duro.Expand("sizes", func(_ context.Context, img Image) ([]int, error) {
 		renderRuns.Add(1)
+		if img.ContentHash == "poison" {
+			return nil, fmt.Errorf("image %s is corrupt", img.ID)
+		}
+		if strings.HasPrefix(img.ContentHash, "slow") {
+			time.Sleep(3 * time.Second) // the strict act's "expensive model call"
+		}
 		return []int{64, 256, 1024}, nil
 	}),
 	duro.Parallel("render-size", 2, func(_ context.Context, size int) (Thumb, error) {
@@ -165,6 +172,44 @@ func galleryPipeline(render *duro.RegisteredWorkflow[Image, Rendered], rendered 
 			return acc, nil
 		}, Manifest{}),
 	)
+}
+
+// --- the strict gallery: cancel-on-failure -----------------------------------
+
+// strictGalleryPipeline is the cost-conscious variant: renders are wasted
+// spend once the batch has failed, so the fan-out opts into
+// WithCancelSiblings — the first failed render cancels every sibling that is
+// not yet terminal, running and never-dequeued alike, instead of draining
+// them. The Rescue around it sees the failing child's error (never a
+// sibling's CANCELLED result) and settles the batch with a refund.
+//
+// Contrast with galleryPipeline above, which keeps the drain default: its
+// deliveries are cheap and every completion has value on its own. The two
+// behaviors are per-stage choices, not application-wide ones.
+func strictGalleryPipeline(render *duro.RegisteredWorkflow[Image, Rendered], batchTag string) duro.Pipeline[[]Image, Manifest] {
+	fleet := duro.Pipe3(
+		duro.Expand("explode", func(_ context.Context, imgs []Image) ([]Image, error) {
+			return imgs, nil
+		}),
+		duro.FanOut("render", renderQueue, render,
+			duro.WithChildID(func(img Image) string { return strictChildID(batchTag, img.ID) }),
+			duro.WithCancelSiblings(),
+		),
+		duro.Reduce("manifest", func(_ context.Context, acc Manifest, r Rendered) (Manifest, error) {
+			acc.Delivered = append(acc.Delivered, Delivered{ImageID: r.ImageID, Count: len(r.Thumbs)})
+			return acc, nil
+		}, Manifest{}),
+	)
+	return duro.Pipe1(
+		duro.Rescue("refund", fleet, func(_ context.Context, _ []Image, cause error) (Manifest, error) {
+			fmt.Printf("      [refund] batch failed, refunding the customer: %v\n", cause)
+			return Manifest{}, nil
+		}),
+	)
+}
+
+func strictChildID(batchTag, imageID string) string {
+	return "strict-" + batchTag + "-" + imageID
 }
 
 // regionOf resolves an image's region for partition routing; a real system

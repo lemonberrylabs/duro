@@ -206,6 +206,7 @@ func ToStream[T any](name string, stream Stream[T]) Stage[T, T] {
 func FromStream[T, V any](name string, stream Stream[V], fn func(in T) (workflowID string), opts ...StepOption) Stage[T, V] {
 	mustValidStage("FromStream", name, fn == nil)
 	mustValidChannel("FromStream", name, stream.key)
+	resolveCancelSiblings("FromStream", name, opts, false)
 	return Stage[T, V]{name: name, kind: "from-stream", apply: ro.FlatMapWithContext(func(ctx context.Context, in T) ro.Observable[V] {
 		state, err := stageState(ctx, name)
 		if err != nil {

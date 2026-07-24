@@ -41,7 +41,10 @@
 // For parallelism, use FanOut (child workflows on a DBOS queue — bounded,
 // distributed, per-child durability) or Parallel (concurrent steps in-process
 // via dbos.Go — lightweight, no queue). Both preserve replay determinism:
-// work is spawned and awaited in stream order on the workflow goroutine.
+// work is spawned and awaited in stream order on the workflow goroutine. On
+// failure both drain surviving siblings by default; WithCancelSiblings
+// (FanOut) and WithCancelSiblingSteps (Parallel) opt a stage into cancelling
+// them instead, while still failing with the original error.
 //
 // The rest of DBOS's workflow toolkit is available as stages: Delay (durable
 // sleep), Send/Recv (durable mailbox messaging — external signals and
@@ -137,8 +140,9 @@ func (s Stage[T, R]) info() stageInfo {
 type StepOption func(*stepConfig)
 
 type stepConfig struct {
-	dbosOpts []dbos.StepOption
-	timeout  time.Duration
+	dbosOpts       []dbos.StepOption
+	timeout        time.Duration
+	cancelSiblings bool // Parallel only; every other constructor panics on it
 }
 
 // stepOption lifts a DBOS step option into a duro StepOption.
@@ -193,6 +197,37 @@ func WithTimeout(d time.Duration) StepOption {
 	return func(c *stepConfig) { c.timeout = d }
 }
 
+// WithCancelSiblingSteps makes the first failed step of a Parallel stage
+// cancel its sibling steps instead of letting the stage drain them: in-flight
+// siblings have their step contexts cancelled (the step function must honor
+// context cancellation for this to take effect, the same contract WithTimeout
+// documents), and items whose steps have not started skip the function
+// entirely. The stage still fails with the first genuinely-failed step's
+// error, in input order — cancelled and skipped siblings never mask it, on
+// the live run and on recovery replay alike, so a Rescue around the stage
+// always sees the original failure.
+//
+// Skipped and cancelled items still occupy their pre-assigned step slots,
+// recording a marker error instead of running the function — the slot count
+// stays deterministic, which is what keeps step IDs aligned on recovery (a
+// recovered workflow that continues past the stage, e.g. through Rescue,
+// would otherwise read misaligned checkpoints). Because the layout is
+// unchanged, the option does not alter the pipeline's shape fingerprint. If
+// the workflow is recovered and reaches the stage again, items with no
+// recorded outcome re-execute, exactly as without the option.
+//
+// A step's own retry policy runs before cancellation triggers: siblings are
+// cancelled only when a step's error escapes its retries, matching when the
+// stage would fail.
+//
+// It applies only to Parallel; every other stage constructor rejects it at
+// construction time. Sequential stages have nothing to cancel — an earlier
+// failure already prevents later items from executing. For the child-workflow
+// equivalent on FanOut, see WithCancelSiblings.
+func WithCancelSiblingSteps() StepOption {
+	return func(c *stepConfig) { c.cancelSiblings = true }
+}
+
 func mustValidStage(kind, name string, fnIsNil bool) {
 	if name == "" {
 		panic(fmt.Sprintf("duro: %s stage requires a non-empty name", kind))
@@ -202,11 +237,26 @@ func mustValidStage(kind, name string, fnIsNil bool) {
 	}
 }
 
+// resolveCancelSiblings probes the step options once at construction time,
+// panicking when WithCancelSiblingSteps reaches a stage that cannot honor it.
+// Only Parallel passes allowed=true.
+func resolveCancelSiblings(kind, name string, opts []StepOption, allowed bool) bool {
+	var cfg stepConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	if cfg.cancelSiblings && !allowed {
+		panic(fmt.Sprintf("duro: %s stage %q: WithCancelSiblingSteps applies only to Parallel stages", kind, name))
+	}
+	return cfg.cancelSiblings
+}
+
 // Step is a durable Map: it transforms each item by running fn as a
 // checkpointed DBOS step. On recovery, completed executions are replayed from
 // the database instead of re-running fn.
 func Step[T, R any](name string, fn func(ctx context.Context, in T) (R, error), opts ...StepOption) Stage[T, R] {
 	mustValidStage("Step", name, fn == nil)
+	resolveCancelSiblings("Step", name, opts, false)
 	return Stage[T, R]{name: name, kind: "step", apply: ro.MapErrWithContext(func(ctx context.Context, in T) (R, context.Context, error) {
 		out, err := runStep(ctx, name, in, fn, opts)
 		return out, ctx, err
@@ -217,6 +267,7 @@ func Step[T, R any](name string, fn func(ctx context.Context, in T) (R, error), 
 // item passes through unchanged.
 func Tap[T any](name string, fn func(ctx context.Context, in T) error, opts ...StepOption) Stage[T, T] {
 	mustValidStage("Tap", name, fn == nil)
+	resolveCancelSiblings("Tap", name, opts, false)
 	s := Step(name, func(ctx context.Context, in T) (T, error) {
 		return in, fn(ctx, in)
 	}, opts...)
@@ -229,6 +280,7 @@ func Tap[T any](name string, fn func(ctx context.Context, in T) error, opts ...S
 // recovery. Items for which the predicate returns false are dropped.
 func Filter[T any](name string, pred func(ctx context.Context, in T) (bool, error), opts ...StepOption) Stage[T, T] {
 	mustValidStage("Filter", name, pred == nil)
+	resolveCancelSiblings("Filter", name, opts, false)
 	return Stage[T, T]{name: name, kind: "filter", apply: ro.FlatMapWithContext(func(ctx context.Context, in T) ro.Observable[T] {
 		keep, err := runStep(ctx, name, in, pred, opts)
 		if err != nil {
@@ -246,6 +298,7 @@ func Filter[T any](name string, pred func(ctx context.Context, in T) (bool, erro
 // downstream in order.
 func Expand[T, R any](name string, fn func(ctx context.Context, in T) ([]R, error), opts ...StepOption) Stage[T, R] {
 	mustValidStage("Expand", name, fn == nil)
+	resolveCancelSiblings("Expand", name, opts, false)
 	return Stage[T, R]{name: name, kind: "expand", apply: ro.FlatMapWithContext(func(ctx context.Context, in T) ro.Observable[R] {
 		outs, err := runStep(ctx, name, in, fn, opts)
 		if err != nil {
@@ -259,6 +312,7 @@ func Expand[T, R any](name string, fn func(ctx context.Context, in T) ([]R, erro
 // step, and the final accumulator is emitted when the source completes.
 func Reduce[T, A any](name string, fn func(ctx context.Context, acc A, in T) (A, error), seed A, opts ...StepOption) Stage[T, A] {
 	mustValidStage("Reduce", name, fn == nil)
+	resolveCancelSiblings("Reduce", name, opts, false)
 	return Stage[T, A]{name: name, kind: "reduce", apply: func(source ro.Observable[T]) ro.Observable[A] {
 		return ro.NewUnsafeObservableWithContext(func(subCtx context.Context, dest ro.Observer[A]) ro.Teardown {
 			acc := seed

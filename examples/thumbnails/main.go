@@ -31,6 +31,7 @@ func main() {
 	batchTag := time.Now().Format("150405.000") // scope demo identities to this invocation
 	deliver := duro.Register(app, "deliver", DeliverPipeline)
 	gallery := duro.Register(app, "gallery", galleryPipeline(render, deliver, batchTag))
+	strict := duro.Register(app, "gallery-strict", strictGalleryPipeline(render, batchTag))
 
 	if err := app.Launch(); err != nil {
 		fatal("launching: %v", err)
@@ -62,6 +63,25 @@ func main() {
 	fmt.Printf("   render executions during rerun: %d\n", renderRuns.Load()-before)
 	fmt.Println("   img-1/2/4 re-attached to their finished renders via WithChildID;")
 	fmt.Println("   img-3 was deduplicated onto img-1 in run 1, so it renders its own child now")
+
+	section("strict gallery (WithCancelSiblings: a corrupt image cancels the surviving fleet)")
+	strictBatch := []Image{
+		{ID: "img-5", Region: "us", ContentHash: "slow-1"}, // a 3s render — wasted spend once the batch fails
+		{ID: "img-6", Region: "eu", ContentHash: "slow-2"},
+		{ID: "img-7", Region: "us", ContentHash: "poison"}, // fails immediately
+	}
+	start := time.Now()
+	manifest = runGallery(app, strict, strictBatch, "strict-"+batchTag)
+	fmt.Printf("   rescued with %d delivered in %s — the slow renders were cancelled,\n",
+		len(manifest.Delivered), time.Since(start).Round(100*time.Millisecond))
+	fmt.Println("   not drained: without the option the batch would settle only after every 3s render finished")
+	for _, img := range strictBatch {
+		status, err := duro.Status(app, strictChildID(batchTag, img.ID))
+		if err != nil {
+			fatal("child status: %v", err)
+		}
+		fmt.Printf("     %s → %s\n", img.ID, status.State)
+	}
 }
 
 func runGallery(app *duro.App, gallery *duro.PipelineWorkflow[[]Image, Manifest], batch []Image, runID string) Manifest {
