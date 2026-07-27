@@ -289,7 +289,7 @@ func resolveChildOpts[T, R any](cfg childConfig, name string, queue Queue, ref W
 // WithCancelSiblings, which cancels every non-terminal sibling promptly
 // while still failing the stage with the original error.
 func FanOut[T, R any](name string, queue Queue, wf WorkflowRef[T, R], opts ...ChildOption) Stage[T, R] {
-	mustValidStage("FanOut", name, wf == nil)
+	mustValidStage(kindFanOut, name, wf == nil)
 	if queue.name == "" {
 		panic(fmt.Sprintf("duro: FanOut stage %q requires a queue built by NewQueue", name))
 	}
@@ -311,9 +311,9 @@ func FanOut[T, R any](name string, queue Queue, wf WorkflowRef[T, R], opts ...Ch
 	// The two modes checkpoint differently (per-child getResult steps vs one
 	// assembled await step), so the option is part of the stage's identity:
 	// toggling it trips the shape guard instead of misreading checkpoints.
-	kind := "fanout"
+	kind := kindFanOut
 	if cfg.cancelSiblings {
-		kind = "fanout+cancel"
+		kind = kindFanOutCancel
 	}
 
 	return Stage[T, R]{name: name, kind: kind, queues: []Queue{queue}, apply: func(source ro.Observable[T]) ro.Observable[R] {

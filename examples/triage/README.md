@@ -16,6 +16,7 @@ go run .    # or: DBOS_SYSTEM_DATABASE_URL=... go run .
 | `Switch` + `When` | tickets dispatch by category to the billing / bug / spam arm |
 | `Branch` (nested inside a Switch arm) | urgent bugs escalate; routine bugs get filed — control flow composes |
 | `Loop` | the escalation path durably polls the fix service (with a `Delay` backoff in the body) until it reports fixed |
+| `WithMaxIterations` | that poll is bounded at 10 rounds, so a fix service that never recovers fails the stage instead of polling forever across restarts |
 | `Rescue` (best-effort segment) | the billing arm's loyalty credit retries (`WithMaxRetries`), then the handler swallows the terminal failure — the refund must not die for a goodwill credit |
 | `Rescue` (whole-pipeline except block) | `GuardedTriagePipeline` wraps the entire triage: report the failure, then rethrow it |
 | `Sub` | one shared `notify` segment reused by three arms under different names |

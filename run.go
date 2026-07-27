@@ -18,19 +18,30 @@ import (
 const ShapeStepName = "duro.shape"
 
 // Run executes the pipeline durably inside a DBOS workflow, feeding it the
-// input value and blocking until completion. It returns the last emitted
-// value, the first stage error, or ErrNoValue if the pipeline emits nothing.
-// Call it as the body of a registered DBOS workflow function.
+// input value and blocking until completion. It returns the pipeline's single
+// emitted value or the first stage error. Call it as the body of a registered
+// DBOS workflow function.
+//
+// Run is for pipelines that produce exactly one result. A pipeline that emits
+// nothing fails with ErrNoValue, and one that emits more than once fails with
+// ErrMultipleValues rather than having Run pick a value on the caller's
+// behalf — a stage like Expand or FanOut left unfolded would otherwise
+// discard every result but one, silently and with nothing to notice. Fold the
+// stream with Reduce or Collect, or use RunAll to receive every value.
 func Run[P, R any](ctx Context, in P, p Pipeline[P, R]) (R, error) {
 	var zero R
 	values, err := RunAll(ctx, in, p)
 	if err != nil {
 		return zero, err
 	}
-	if len(values) == 0 {
+	switch len(values) {
+	case 0:
 		return zero, ErrNoValue
+	case 1:
+		return values[0], nil
+	default:
+		return zero, fmt.Errorf("%w: %d values emitted; fold the stream with Reduce or Collect, or call RunAll", ErrMultipleValues, len(values))
 	}
-	return values[len(values)-1], nil
 }
 
 // RunAll is Run for pipelines whose final stage legitimately emits multiple

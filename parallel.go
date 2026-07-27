@@ -33,9 +33,11 @@ import (
 // in-flight siblings and skip unstarted items instead, while still failing
 // with the first genuine error.
 func Parallel[T, R any](name string, maxConcurrent int, fn func(ctx context.Context, in T) (R, error), opts ...StepOption) Stage[T, R] {
-	mustValidStage("Parallel", name, fn == nil)
-	cancelSiblings := resolveCancelSiblings("Parallel", name, opts, true)
-	return Stage[T, R]{name: name, kind: "parallel", apply: func(source ro.Observable[T]) ro.Observable[R] {
+	mustValidStage(kindParallel, name, fn == nil)
+	mustValidConcurrency(kindParallel, name, maxConcurrent)
+	cancelSiblings := resolveCancelSiblings(kindParallel, name, opts, true)
+	resolveLoopBound(kindParallel, name, opts, false)
+	return Stage[T, R]{name: name, kind: kindParallel, apply: func(source ro.Observable[T]) ro.Observable[R] {
 		return ro.NewUnsafeObservableWithContext(func(subCtx context.Context, dest ro.Observer[R]) ro.Teardown {
 			var outcomes []<-chan dbos.StepOutcome[R]
 			var sem chan struct{}

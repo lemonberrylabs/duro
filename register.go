@@ -113,6 +113,17 @@ func Register[P, R any](ctx Context, name string, p Pipeline[P, R], opts ...Work
 	return w
 }
 
+// RegisterJob registers a pipeline under a Job's name, tying the registration
+// to the same declaration the enqueuing side uses. Prefer it over Register for
+// any pipeline another process enqueues with Enqueue: the Job carries the name
+// and both types, so a rename or a type change is a compile error on both
+// sides instead of a run that strands on the queue. Otherwise identical to
+// Register.
+func RegisterJob[P, R any](ctx Context, job Job[P, R], p Pipeline[P, R], opts ...WorkflowRegistrationOption) *PipelineWorkflow[P, R] {
+	mustValidJob("RegisterJob", job)
+	return Register(ctx, job.name, p, opts...)
+}
+
 // RegisterScheduled registers the pipeline as a scheduled (cron) workflow:
 // every tick starts a durable run whose input is the scheduled time. The
 // schedule uses cron syntax with seconds precision ("*/30 * * * * *" = every

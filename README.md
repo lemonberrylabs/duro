@@ -143,7 +143,7 @@ DBOS_SYSTEM_DATABASE_URL=postgres://$USER@localhost:5432/quickstart go run .
 | `duro.Expand(name, fn)` | one item → many (`T → []R`), emitted in order | ✅ checkpointed step |
 | `duro.Reduce(name, fn, seed)` | fold the stream; emits the final accumulator | ✅ one step per accumulation |
 | `duro.FanOut(name, queue, wf)` | parallel map: each item runs as a child workflow on a declared `Queue` | ✅ every child is a durable workflow |
-| `duro.Parallel(name, max, fn)` | parallel map: concurrent steps in-process, at most `max` at a time | ✅ pre-assigned step per item |
+| `duro.Parallel(name, max, fn)` | parallel map: concurrent steps in-process, at most `max` at a time (`duro.Unbounded` to lift the cap) | ✅ pre-assigned step per item |
 | `duro.Delay(name, d)` | durable pause per item | ✅ recovery resumes the remaining time |
 | `duro.Send(name, topic, fn)` | message another workflow's mailbox on a typed `Topic` | ✅ no re-send on replay |
 | `duro.Recv(name, topic, timeout)` | pause until a `Topic` message arrives; emits it | ✅ no double-consume on replay |
@@ -153,7 +153,7 @@ DBOS_SYSTEM_DATABASE_URL=postgres://$USER@localhost:5432/quickstart go run .
 | `duro.FromStream(name, stream, fn)` | drain another workflow's `Stream`; emits its values | ✅ the whole read is one checkpoint |
 | `duro.Branch(name, pred, then, els)` | route each item through one of two pipelines | ✅ the verdict is a checkpointed step |
 | `duro.Switch(name, route, When(k, p)...)` | multi-way dispatch to case pipelines | ✅ the route key is a checkpointed step |
-| `duro.Loop(name, body, until)` | repeat a pipeline until done; durable polling with `Delay` | ✅ every iteration's verdict is checkpointed |
+| `duro.Loop(name, body, until)` | repeat a pipeline until done; durable polling with `Delay`; bound it with `WithMaxIterations` | ✅ every iteration's verdict is checkpointed |
 | `duro.Rescue(name, pipeline, handler)` | except block: intercept an embedded pipeline's failure — swallow with a fallback or rethrow | ✅ the handler is a checkpointed step |
 | `duro.Sub(name, pipeline)` | embed a pipeline as one named stage (whole-stream) | ✅ its stages checkpoint as usual |
 | `duro.Via(name, pipeline)` | run an embedded pipeline for its effects — typically a fan-out — and pass the original item through | ✅ its stages checkpoint as usual |
@@ -165,8 +165,18 @@ Stages compose with `duro.Pipe1`…`Pipe8` into a `Pipeline[P, R]`. Register
 one as a workflow (`duro.Register`, below) or run it inside a hand-written
 workflow body:
 
-- `duro.Run(ctx, input, pipeline)` — returns the last emitted value
+- `duro.Run(ctx, input, pipeline)` — returns the pipeline's single emitted
+  value. A pipeline emitting nothing fails with `ErrNoValue`, and one emitting
+  more than once fails with `ErrMultipleValues` rather than picking a value on
+  your behalf: an unfolded `Expand` or `FanOut` would otherwise discard every
+  result but one, silently.
 - `duro.RunAll(ctx, input, pipeline)` — returns every emitted value
+
+Stage names must be unique within a pipeline — a name is how a stage is
+identified in the recorded step list, so duplicates would make
+`ForkFromStage` ambiguous. Arms of the same `Branch` or `Switch` may reuse
+names freely, since only one arm ever runs. Names beginning `duro.` are
+reserved for duro's own bookkeeping steps.
 
 For the rare logic no combinator fits (mostly interop with existing DBOS
 code), hand-written workflows are declared against `duro.Context` — an alias
@@ -389,7 +399,9 @@ When you don't need queue-level distribution or per-child durability,
 `duro.Parallel(name, max, fn)` is the lightweight sibling: concurrent **steps**
 inside the workflow process (built on `dbos.Go`, which pre-assigns each step's
 ID deterministically), bounded by `max`, with results in input order — no
-queue, no polling latency. It drains on failure by default too;
+queue, no polling latency. `max` must be a positive bound or the explicit
+`duro.Unbounded`; a plain `0` is rejected at construction, so an unset config
+field can never silently mean "launch a step per item with no ceiling". It drains on failure by default too;
 `duro.WithCancelSiblingSteps()` is its cancellation opt-in — in-flight
 siblings get their step contexts cancelled (the function must honor
 cancellation, the same contract as `WithTimeout`) and unstarted items skip
@@ -496,6 +508,112 @@ handle, err := duro.ForkFromStage[Confirmation](app, duro.Fork{
 })
 ```
 
+## Worker-pool mode
+
+DBOS recovers a crashed process's in-flight runs only when that same process
+restarts under the same executor ID. On ephemeral autoscaled infrastructure
+(Cloud Run, ECS, spot instances) a dead worker never returns under its old
+identity, so its `PENDING` runs strand. Worker-pool mode closes that gap without
+DBOS Conductor: every process heartbeats a lease, and a sweeper on each process
+re-enqueues the runs of any process whose lease has gone stale, where a live
+worker picks them up.
+
+```go
+app, err := duro.New(ctx, duro.Config{
+	Name:               "orders",
+	DatabaseURL:        url,
+	ApplicationVersion: gitSHA, // pin it — see below
+}, duro.WithWorkerPool())
+```
+
+Enable it on **every** worker in the fleet. A killed worker's run resumes on a
+survivor within the stale threshold plus one sweep; a graceful `Shutdown`
+tombstones the lease so undrained runs are taken over on the next sweep with no
+wait. Takeover guarantees exactly-once workflow completion but, like all DBOS
+recovery, at-least-once step side effects — keep steps idempotent. Tune the
+cadence (defaults: 10s heartbeat / 60s stale / 30s sweep) with
+`WithHeartbeatInterval`, `WithStaleThreshold`, `WithSweepInterval`; `New` rejects
+a stale threshold under 2× the heartbeat interval, since a threshold that tight
+declares merely-slow workers dead and runs their live work twice. Leave real
+headroom for GC pauses — the defaults are 6×.
+
+### Identity: application version and executor ID
+
+`Config.ApplicationVersion` and `Config.ExecutorID` are the two knobs that scope
+recovery — previously reachable only through the `DBOS__APPVERSION` / `DBOS__VMID`
+environment variables, which still override them. **Pin `ApplicationVersion`** to
+a value you control (a git SHA, a release tag): its default is a hash of the
+binary, so every in-flight run strands the moment you deploy new code,
+recoverable only by rolling back to the exact previous binary. A run is only ever
+taken over by an executor on the same version — a new deploy never adopts (and
+replays on incompatible code) the previous version's runs. In worker-pool mode a
+process without an explicit `ExecutorID` is assigned a unique one automatically.
+
+### Enqueue-only client
+
+A web tier that starts workflows but must never execute them uses a `Client` — no
+engine, no queue runners, but the same typed surface and the same status mapping
+as the workers:
+
+```go
+// declared once, in a package both binaries import
+var InvoiceJob = duro.NewJob[Batch, Invoice]("invoice")
+
+// on the workers
+duro.RegisterJob(app, InvoiceJob, invoicePipeline)
+
+// in the web tier
+c, err := duro.NewClient(ctx, duro.ClientConfig{DatabaseURL: url})
+defer c.Shutdown(5 * time.Second)
+
+handle, err := duro.Enqueue(c, Jobs, InvoiceJob, batch)
+status, err := c.Status(handle.ID()) // duro.RunStatus, the same States as duro.Status
+```
+
+A `Job` is the pipeline's cross-process identity: its registered name and both
+of its types in one declaration, shared by the process that registers it and
+every process that enqueues it. That is what makes the enqueue checkable —
+enqueuing by bare string, a typo produces a run no worker can dispatch, which
+is inserted successfully, reported as a healthy `enqueued`, and waits forever,
+while a mismatched input or result type fails in another process long after the
+call site. With a `Job` all three are compile errors.
+
+Enqueue stamps no application version by default, so any worker version runs the
+job (the web tier need not redeploy in lockstep with the workers); pin one with
+`WithClientApplicationVersion`.
+
+`Client` is also how a *worker* hands a whole pipeline to the fleet rather than
+running it in-process: `wf.Start` always runs the pipeline on the calling
+process, and queues are for fan-out children (`FanOut`), so a worker that wants
+to enqueue a top-level run builds a `Client` alongside its engine.
+
+### Stale-run warnings and retention
+
+Two more operational gaps DBOS open source leaves, both opt-in beside the worker
+pool and usable with or without it:
+
+```go
+duro.New(ctx, cfg,
+	duro.WithWorkerPool(),
+	duro.WithStaleRunWarning(15*time.Minute), // surface non-terminal runs older than this
+	duro.WithRetention(30*24*time.Hour),      // batch-delete terminal runs older than this
+)
+```
+
+`WithStaleRunWarning` reports stranded runs — which DBOS otherwise surfaces
+nowhere — split into same-version (in limbo here) and other-version (recoverable
+only on their own version); pass a callback to also receive the counts. Set the
+age above the longest a healthy run legitimately takes: a run parked in a `Delay`
+stage stays pending for the whole pause. `WithRetention` bounds the
+otherwise-unbounded growth of terminal run history, deleting one batch per cycle
+under its own advisory lock — never the sweeper's, so housekeeping can never
+delay a takeover.
+
+Both run on the sweep cadence, and both are **database-wide**: DBOS records no
+application name on a run, so they count and delete every matching run in the
+system database, including other applications' runs if they share it. Give each
+application its own database (or DBOS schema) before enabling retention.
+
 ## Built-in safety
 
 DBOS replay determinism requires that the Nth step call on recovery is the
@@ -558,6 +676,11 @@ whole feature set:
   pipelines, debounced bursts, forking a finished run from a named stage
   after a fix, and a three-phase walkthrough of the durable-identity
   contract and the stranded-run warning.
+- [`examples/fleet`](examples/fleet) — **worker-pool mode**: a two-process app —
+  a `duro.New`+`WithWorkerPool` worker fleet and a `duro.NewClient` web tier that
+  enqueues without an engine — plus a `-crash` flag that kills a worker mid-run so
+  you can watch a survivor's sweeper take the run over and finish it, replaying the
+  checkpointed steps and re-running only the in-flight one.
 - [`examples/orders`](examples/orders) — **the fundamentals**: the same order
   workflow written both as plain sequential DBOS steps and as a duro pipeline
   (their recorded checkpoints are identical), plus a crash-recovery demo:

@@ -67,7 +67,10 @@
 // pipeline as a DBOS workflow, RegisterScheduled runs one on a cron schedule
 // (typed Pipeline[time.Time, R]), RegisterDebounced collapses bursts of
 // triggers into a single run, and RegisterWorkflow covers hand-written
-// workflow functions. Runs are tracked by workflow ID from any process:
+// workflow functions. A pipeline another process enqueues is declared as a
+// Job — its name and both types in one value — and registered with
+// RegisterJob, so the name and types cannot drift between the binary that
+// runs it and the binary that enqueues it. Runs are tracked by workflow ID from any process:
 // Status/StatusAll reconcile a persisted ID against the engine, Attach
 // reconnects to a live handle, and ForkFromStage restarts a completed or
 // failed run from a named stage — optionally onto a different application
@@ -78,6 +81,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -115,21 +119,66 @@ type WorkflowRegistrationOption = dbos.WorkflowRegistrationOption
 // any value (for example, when a Filter stage drops every item).
 var ErrNoValue = errors.New("duro: pipeline completed without emitting a value")
 
+// ErrMultipleValues is returned by Run when the pipeline emits more than one
+// value. Run yields a single result, so more than one emission is ambiguous
+// rather than something Run could silently pick from: end the pipeline with
+// Reduce or Collect to fold the stream, or call RunAll to receive every value.
+var ErrMultipleValues = errors.New("duro: pipeline emitted more than one value")
+
+// ErrMaxIterations is returned by a Loop stage configured with
+// WithMaxIterations whose predicate did not report done within that many
+// iterations. Without the option a Loop is unbounded; see WithMaxIterations.
+var ErrMaxIterations = errors.New("duro: loop exceeded its maximum iterations")
+
 // ErrAborted marks stage executions skipped because an earlier stage already
 // failed. It never surfaces from Run: the first failure is the pipeline's
 // error, and ErrAborted only travels through already-terminated downstream
 // observers.
 var ErrAborted = errors.New("duro: pipeline aborted by an earlier stage failure")
 
+// stageKind names a stage constructor in the pipeline's shape fingerprint.
+// The fingerprint is a durability checkpoint compared on every replay, so
+// these string values are part of duro's on-disk format: renaming one
+// invalidates the recorded shape of every in-flight run built from that
+// constructor. Add kinds freely; never change an existing value.
+type stageKind string
+
+const (
+	kindStep         stageKind = "step"
+	kindTap          stageKind = "tap"
+	kindFilter       stageKind = "filter"
+	kindExpand       stageKind = "expand"
+	kindReduce       stageKind = "reduce"
+	kindPure         stageKind = "pure"
+	kindUnsafe       stageKind = "unsafe"
+	kindParallel     stageKind = "parallel"
+	kindFanOut       stageKind = "fanout"
+	kindFanOutCancel stageKind = "fanout+cancel"
+	kindBranch       stageKind = "branch"
+	kindSwitch       stageKind = "switch"
+	kindLoop         stageKind = "loop"
+	kindRescue       stageKind = "rescue"
+	kindSub          stageKind = "sub"
+	kindVia          stageKind = "via"
+	kindCollect      stageKind = "collect"
+	kindDelay        stageKind = "delay"
+	kindSend         stageKind = "send"
+	kindRecv         stageKind = "recv"
+	kindSetEvent     stageKind = "set-event"
+	kindGetEvent     stageKind = "get-event"
+	kindToStream     stageKind = "to-stream"
+	kindFromStream   stageKind = "from-stream"
+)
+
 // Stage is one typed pipeline segment. Stages are nominal: only this
 // package's constructors can build them, which is what keeps arbitrary ro
 // operators out of durable pipelines at compile time.
 type Stage[T, R any] struct {
 	name   string
-	kind   string
+	kind   stageKind
 	apply  func(ro.Observable[T]) ro.Observable[R]
-	queues []Queue  // queues this stage enqueues onto (FanOut); Register auto-registers them
-	nested []string // fingerprints of embedded pipelines (Branch/Switch/Loop/Sub)
+	queues []Queue       // queues this stage enqueues onto (FanOut); Register auto-registers them
+	nested []nestedShape // shapes of embedded pipelines (Branch/Switch/Loop/Rescue/Sub/Via)
 }
 
 func (s Stage[T, R]) info() stageInfo {
@@ -143,6 +192,7 @@ type stepConfig struct {
 	dbosOpts       []dbos.StepOption
 	timeout        time.Duration
 	cancelSiblings bool // Parallel only; every other constructor panics on it
+	maxIterations  int  // Loop only; every other constructor panics on it
 }
 
 // stepOption lifts a DBOS step option into a duro StepOption.
@@ -228,19 +278,78 @@ func WithCancelSiblingSteps() StepOption {
 	return func(c *stepConfig) { c.cancelSiblings = true }
 }
 
-func mustValidStage(kind, name string, fnIsNil bool) {
+// WithMaxIterations bounds a Loop: if the predicate has not reported done
+// after n iterations, the stage fails with ErrMaxIterations instead of
+// looping forever. A durable loop outlives the process running it, so an
+// unbounded one whose predicate can never be satisfied keeps checkpointing
+// across restarts until someone cancels the workflow by hand.
+//
+// The bound is enforced from the checkpointed iteration count, so a recovered
+// run resumes with the same budget it had rather than a fresh one.
+//
+// It applies only to Loop; every other stage constructor rejects it at
+// construction time.
+func WithMaxIterations(n int) StepOption {
+	if n <= 0 {
+		panic(fmt.Sprintf("duro: WithMaxIterations requires a positive count, got %d", n))
+	}
+	return func(c *stepConfig) { c.maxIterations = n }
+}
+
+// resolveLoopBound probes the step options once at construction time,
+// panicking when WithMaxIterations reaches a stage that cannot honor it. Only
+// Loop passes allowed=true.
+func resolveLoopBound(kind stageKind, name string, opts []StepOption, allowed bool) int {
+	var cfg stepConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	if cfg.maxIterations != 0 && !allowed {
+		panic(fmt.Sprintf("duro: %s stage %q: WithMaxIterations applies only to Loop stages", kind, name))
+	}
+	return cfg.maxIterations
+}
+
+// reservedStageNamePrefix is the namespace duro keeps for its own bookkeeping
+// steps (ShapeStepName is the first). A user stage carrying this prefix would
+// be indistinguishable from a duro-internal step in the recorded step list,
+// which is what ForkFromStage and every debugging tool read.
+const reservedStageNamePrefix = "duro."
+
+func mustValidStage(kind stageKind, name string, fnIsNil bool) {
 	if name == "" {
 		panic(fmt.Sprintf("duro: %s stage requires a non-empty name", kind))
+	}
+	if strings.HasPrefix(name, reservedStageNamePrefix) {
+		panic(fmt.Sprintf("duro: %s stage %q uses the reserved %q name prefix, which duro keeps for its own bookkeeping steps", kind, name, reservedStageNamePrefix))
 	}
 	if fnIsNil {
 		panic(fmt.Sprintf("duro: %s stage %q requires a non-nil function", kind, name))
 	}
 }
 
+// Unbounded lifts Parallel's concurrency cap: every item's step is launched as
+// soon as it arrives. Prefer a real bound — an unbounded Parallel over a large
+// stream launches one in-process step per item with nothing holding it back.
+// It exists so that removing the cap is something a caller states outright
+// rather than something a zero-valued variable does by accident.
+const Unbounded = -1
+
+// mustValidConcurrency rejects a concurrency limit that is neither a positive
+// bound nor the explicit Unbounded sentinel. A plain zero is the dangerous
+// case — an unset config field or an empty slice's length reaching the
+// argument — so it fails here instead of silently meaning "no limit".
+func mustValidConcurrency(kind stageKind, name string, maxConcurrent int) {
+	if maxConcurrent > 0 || maxConcurrent == Unbounded {
+		return
+	}
+	panic(fmt.Sprintf("duro: %s stage %q requires a positive concurrency limit or duro.Unbounded, got %d", kind, name, maxConcurrent))
+}
+
 // resolveCancelSiblings probes the step options once at construction time,
 // panicking when WithCancelSiblingSteps reaches a stage that cannot honor it.
 // Only Parallel passes allowed=true.
-func resolveCancelSiblings(kind, name string, opts []StepOption, allowed bool) bool {
+func resolveCancelSiblings(kind stageKind, name string, opts []StepOption, allowed bool) bool {
 	var cfg stepConfig
 	for _, opt := range opts {
 		opt(&cfg)
@@ -255,9 +364,10 @@ func resolveCancelSiblings(kind, name string, opts []StepOption, allowed bool) b
 // checkpointed DBOS step. On recovery, completed executions are replayed from
 // the database instead of re-running fn.
 func Step[T, R any](name string, fn func(ctx context.Context, in T) (R, error), opts ...StepOption) Stage[T, R] {
-	mustValidStage("Step", name, fn == nil)
-	resolveCancelSiblings("Step", name, opts, false)
-	return Stage[T, R]{name: name, kind: "step", apply: ro.MapErrWithContext(func(ctx context.Context, in T) (R, context.Context, error) {
+	mustValidStage(kindStep, name, fn == nil)
+	resolveCancelSiblings(kindStep, name, opts, false)
+	resolveLoopBound(kindStep, name, opts, false)
+	return Stage[T, R]{name: name, kind: kindStep, apply: ro.MapErrWithContext(func(ctx context.Context, in T) (R, context.Context, error) {
 		out, err := runStep(ctx, name, in, fn, opts)
 		return out, ctx, err
 	})}
@@ -266,12 +376,13 @@ func Step[T, R any](name string, fn func(ctx context.Context, in T) (R, error), 
 // Tap is a durable side effect: fn runs as a checkpointed DBOS step and the
 // item passes through unchanged.
 func Tap[T any](name string, fn func(ctx context.Context, in T) error, opts ...StepOption) Stage[T, T] {
-	mustValidStage("Tap", name, fn == nil)
-	resolveCancelSiblings("Tap", name, opts, false)
+	mustValidStage(kindTap, name, fn == nil)
+	resolveCancelSiblings(kindTap, name, opts, false)
+	resolveLoopBound(kindTap, name, opts, false)
 	s := Step(name, func(ctx context.Context, in T) (T, error) {
 		return in, fn(ctx, in)
 	}, opts...)
-	s.kind = "tap"
+	s.kind = kindTap
 	return s
 }
 
@@ -279,9 +390,10 @@ func Tap[T any](name string, fn func(ctx context.Context, in T) error, opts ...S
 // so effectful or non-deterministic predicates still replay consistently on
 // recovery. Items for which the predicate returns false are dropped.
 func Filter[T any](name string, pred func(ctx context.Context, in T) (bool, error), opts ...StepOption) Stage[T, T] {
-	mustValidStage("Filter", name, pred == nil)
-	resolveCancelSiblings("Filter", name, opts, false)
-	return Stage[T, T]{name: name, kind: "filter", apply: ro.FlatMapWithContext(func(ctx context.Context, in T) ro.Observable[T] {
+	mustValidStage(kindFilter, name, pred == nil)
+	resolveCancelSiblings(kindFilter, name, opts, false)
+	resolveLoopBound(kindFilter, name, opts, false)
+	return Stage[T, T]{name: name, kind: kindFilter, apply: ro.FlatMapWithContext(func(ctx context.Context, in T) ro.Observable[T] {
 		keep, err := runStep(ctx, name, in, pred, opts)
 		if err != nil {
 			return ro.Throw[T](err)
@@ -297,9 +409,10 @@ func Filter[T any](name string, pred func(ctx context.Context, in T) (bool, erro
 // as a checkpointed DBOS step and each element of its result is emitted
 // downstream in order.
 func Expand[T, R any](name string, fn func(ctx context.Context, in T) ([]R, error), opts ...StepOption) Stage[T, R] {
-	mustValidStage("Expand", name, fn == nil)
-	resolveCancelSiblings("Expand", name, opts, false)
-	return Stage[T, R]{name: name, kind: "expand", apply: ro.FlatMapWithContext(func(ctx context.Context, in T) ro.Observable[R] {
+	mustValidStage(kindExpand, name, fn == nil)
+	resolveCancelSiblings(kindExpand, name, opts, false)
+	resolveLoopBound(kindExpand, name, opts, false)
+	return Stage[T, R]{name: name, kind: kindExpand, apply: ro.FlatMapWithContext(func(ctx context.Context, in T) ro.Observable[R] {
 		outs, err := runStep(ctx, name, in, fn, opts)
 		if err != nil {
 			return ro.Throw[R](err)
@@ -311,9 +424,10 @@ func Expand[T, R any](name string, fn func(ctx context.Context, in T) ([]R, erro
 // Reduce is a durable fold: each accumulation runs as a checkpointed DBOS
 // step, and the final accumulator is emitted when the source completes.
 func Reduce[T, A any](name string, fn func(ctx context.Context, acc A, in T) (A, error), seed A, opts ...StepOption) Stage[T, A] {
-	mustValidStage("Reduce", name, fn == nil)
-	resolveCancelSiblings("Reduce", name, opts, false)
-	return Stage[T, A]{name: name, kind: "reduce", apply: func(source ro.Observable[T]) ro.Observable[A] {
+	mustValidStage(kindReduce, name, fn == nil)
+	resolveCancelSiblings(kindReduce, name, opts, false)
+	resolveLoopBound(kindReduce, name, opts, false)
+	return Stage[T, A]{name: name, kind: kindReduce, apply: func(source ro.Observable[T]) ro.Observable[A] {
 		return ro.NewUnsafeObservableWithContext(func(subCtx context.Context, dest ro.Observer[A]) ro.Teardown {
 			acc := seed
 			failed := false
@@ -353,8 +467,8 @@ func Reduce[T, A any](name string, fn func(ctx context.Context, acc A, in T) (A,
 // cheap reshaping between durable stages; anything effectful or fallible
 // belongs in Step.
 func Pure[T, R any](name string, fn func(in T) R) Stage[T, R] {
-	mustValidStage("Pure", name, fn == nil)
-	return Stage[T, R]{name: name, kind: "pure", apply: ro.Map(fn)}
+	mustValidStage(kindPure, name, fn == nil)
+	return Stage[T, R]{name: name, kind: kindPure, apply: ro.Map(fn)}
 }
 
 // UnsafeOperator admits an arbitrary ro operator into a durable pipeline.
@@ -363,8 +477,8 @@ func Pure[T, R any](name string, fn func(in T) R) Stage[T, R] {
 // loudly if step names misalign or execution changes goroutines, silently if
 // identically-named steps swap positions. Prefer the safe constructors.
 func UnsafeOperator[T, R any](name string, op func(ro.Observable[T]) ro.Observable[R]) Stage[T, R] {
-	mustValidStage("UnsafeOperator", name, op == nil)
-	return Stage[T, R]{name: name, kind: "unsafe", apply: op}
+	mustValidStage(kindUnsafe, name, op == nil)
+	return Stage[T, R]{name: name, kind: kindUnsafe, apply: op}
 }
 
 // pipelineState carries the workflow's DBOSContext, the subscribing

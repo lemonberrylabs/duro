@@ -15,13 +15,11 @@ import (
 // sleep completes instantly. Use it for pacing between durable stages;
 // remember it applies per item on multi-item streams.
 func Delay[T any](name string, d time.Duration) Stage[T, T] {
-	if name == "" {
-		panic("duro: Delay stage requires a non-empty name")
-	}
+	mustValidStage(kindDelay, name, false)
 	if d <= 0 {
 		panic(fmt.Sprintf("duro: Delay stage %q requires a positive duration", name))
 	}
-	return Stage[T, T]{name: name, kind: "delay", apply: ro.MapErrWithContext(func(ctx context.Context, in T) (T, context.Context, error) {
+	return Stage[T, T]{name: name, kind: kindDelay, apply: ro.MapErrWithContext(func(ctx context.Context, in T) (T, context.Context, error) {
 		state, err := stageState(ctx, name)
 		if err != nil {
 			return in, ctx, err
@@ -40,9 +38,9 @@ func Delay[T any](name string, d time.Duration) Stage[T, T] {
 // through unchanged. The message type is the topic's — a mismatch with the
 // receiving side is a compile error.
 func Send[T, M any](name string, topic Topic[M], fn func(in T) (destinationID string, message M, err error)) Stage[T, T] {
-	mustValidStage("Send", name, fn == nil)
-	mustValidChannel("Send", name, topic.name)
-	return Stage[T, T]{name: name, kind: "send", apply: ro.MapErrWithContext(func(ctx context.Context, in T) (T, context.Context, error) {
+	mustValidStage(kindSend, name, fn == nil)
+	mustValidChannel(kindSend, name, topic.name)
+	return Stage[T, T]{name: name, kind: kindSend, apply: ro.MapErrWithContext(func(ctx context.Context, in T) (T, context.Context, error) {
 		state, err := stageState(ctx, name)
 		if err != nil {
 			return in, ctx, err
@@ -70,11 +68,9 @@ func Send[T, M any](name string, topic Topic[M], fn func(in T) (destinationID st
 // confirmation, a human approval — sent to this workflow's ID with a Send
 // stage or Topic.Send from anywhere.
 func Recv[T, M any](name string, topic Topic[M], timeout time.Duration) Stage[T, M] {
-	if name == "" {
-		panic("duro: Recv stage requires a non-empty name")
-	}
-	mustValidChannel("Recv", name, topic.name)
-	return Stage[T, M]{name: name, kind: "recv", apply: ro.MapErrWithContext(func(ctx context.Context, _ T) (M, context.Context, error) {
+	mustValidStage(kindRecv, name, false)
+	mustValidChannel(kindRecv, name, topic.name)
+	return Stage[T, M]{name: name, kind: kindRecv, apply: ro.MapErrWithContext(func(ctx context.Context, _ T) (M, context.Context, error) {
 		var zero M
 		state, err := stageState(ctx, name)
 		if err != nil {
@@ -94,9 +90,9 @@ func Recv[T, M any](name string, topic Topic[M], timeout time.Duration) Stage[T,
 // Event.Get — the classic use is exposing pipeline progress to the outside
 // world while the workflow runs.
 func SetEvent[T, V any](name string, event Event[V], fn func(in T) V) Stage[T, T] {
-	mustValidStage("SetEvent", name, fn == nil)
-	mustValidChannel("SetEvent", name, event.key)
-	return Stage[T, T]{name: name, kind: "set-event", apply: ro.MapErrWithContext(func(ctx context.Context, in T) (T, context.Context, error) {
+	mustValidStage(kindSetEvent, name, fn == nil)
+	mustValidChannel(kindSetEvent, name, event.key)
+	return Stage[T, T]{name: name, kind: kindSetEvent, apply: ro.MapErrWithContext(func(ctx context.Context, in T) (T, context.Context, error) {
 		state, err := stageState(ctx, name)
 		if err != nil {
 			return in, ctx, err
@@ -116,9 +112,9 @@ func SetEvent[T, V any](name string, event Event[V], fn func(in T) V) Stage[T, T
 // checkpointed — a recovered workflow replays the value it already observed
 // instead of re-reading.
 func GetEvent[T, V any](name string, event Event[V], fn func(in T) (workflowID string), timeout time.Duration) Stage[T, V] {
-	mustValidStage("GetEvent", name, fn == nil)
-	mustValidChannel("GetEvent", name, event.key)
-	return Stage[T, V]{name: name, kind: "get-event", apply: ro.MapErrWithContext(func(ctx context.Context, in T) (V, context.Context, error) {
+	mustValidStage(kindGetEvent, name, fn == nil)
+	mustValidChannel(kindGetEvent, name, event.key)
+	return Stage[T, V]{name: name, kind: kindGetEvent, apply: ro.MapErrWithContext(func(ctx context.Context, in T) (V, context.Context, error) {
 		var zero V
 		state, err := stageState(ctx, name)
 		if err != nil {
@@ -140,12 +136,10 @@ func GetEvent[T, V any](name string, event Event[V], fn func(in T) (workflowID s
 // waiting for the final result. The stream's type is the pipeline's item
 // type, checked at compile time.
 func ToStream[T any](name string, stream Stream[T]) Stage[T, T] {
-	if name == "" {
-		panic("duro: ToStream stage requires a non-empty name")
-	}
-	mustValidChannel("ToStream", name, stream.key)
+	mustValidStage(kindToStream, name, false)
+	mustValidChannel(kindToStream, name, stream.key)
 	writeOpts := stream.writeOptions()
-	return Stage[T, T]{name: name, kind: "to-stream", apply: func(source ro.Observable[T]) ro.Observable[T] {
+	return Stage[T, T]{name: name, kind: kindToStream, apply: func(source ro.Observable[T]) ro.Observable[T] {
 		return ro.NewUnsafeObservableWithContext(func(subCtx context.Context, dest ro.Observer[T]) ro.Teardown {
 			failed := false
 
@@ -204,10 +198,11 @@ func ToStream[T any](name string, stream Stream[T]) Stage[T, T] {
 // that may have changed. Pair it with WithTimeout to bound how long the
 // stage waits for the writer to finish.
 func FromStream[T, V any](name string, stream Stream[V], fn func(in T) (workflowID string), opts ...StepOption) Stage[T, V] {
-	mustValidStage("FromStream", name, fn == nil)
-	mustValidChannel("FromStream", name, stream.key)
-	resolveCancelSiblings("FromStream", name, opts, false)
-	return Stage[T, V]{name: name, kind: "from-stream", apply: ro.FlatMapWithContext(func(ctx context.Context, in T) ro.Observable[V] {
+	mustValidStage(kindFromStream, name, fn == nil)
+	mustValidChannel(kindFromStream, name, stream.key)
+	resolveCancelSiblings(kindFromStream, name, opts, false)
+	resolveLoopBound(kindFromStream, name, opts, false)
+	return Stage[T, V]{name: name, kind: kindFromStream, apply: ro.FlatMapWithContext(func(ctx context.Context, in T) ro.Observable[V] {
 		state, err := stageState(ctx, name)
 		if err != nil {
 			return ro.Throw[V](err)
@@ -248,7 +243,7 @@ func collectStream[V any](stepCtx context.Context, dctx dbos.DBOSContext, workfl
 
 // mustValidChannel panics when a stage references a zero-value channel — the
 // channel must come from NewTopic/NewEvent/NewStream.
-func mustValidChannel(kind, name, channelName string) {
+func mustValidChannel(kind stageKind, name, channelName string) {
 	if channelName == "" {
 		panic(fmt.Sprintf("duro: %s stage %q requires a channel built by NewTopic/NewEvent/NewStream", kind, name))
 	}

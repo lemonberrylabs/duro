@@ -174,7 +174,7 @@ func fanShapeToggleWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
 func parCancelWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
 	return duro.RunAll(ctx, ns, duro.Pipe2(
 		duro.Expand("explode", explodeInts),
-		duro.Parallel("par", 0, func(ctx context.Context, n int) (int, error) {
+		duro.Parallel("par", duro.Unbounded, func(ctx context.Context, n int) (int, error) {
 			if n < 0 {
 				time.Sleep(100 * time.Millisecond)
 				return 0, fmt.Errorf("synthetic step failure %d", n)
@@ -207,7 +207,7 @@ func parCancelRescueWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
 	return duro.Run(ctx, ns, duro.Pipe1(
 		duro.Rescue("save", duro.Pipe2(
 			duro.Expand("explode", explodeInts),
-			duro.Parallel("par", 0, func(ctx context.Context, n int) (int, error) {
+			duro.Parallel("par", duro.Unbounded, func(ctx context.Context, n int) (int, error) {
 				parRescueRuns.Add(1)
 				if n < 0 {
 					time.Sleep(100 * time.Millisecond)

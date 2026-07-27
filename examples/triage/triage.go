@@ -108,6 +108,11 @@ var bugArm = duro.Pipe1(
 				func(_ context.Context, t Ticket) (bool, error) {
 					return t.Attempts >= 3, nil // the "fix service" reports fixed on the third poll
 				},
+				// A durable loop outlives the process running it, so a fix
+				// service that never reports healthy would poll forever across
+				// restarts. The bound turns that into an ordinary stage failure
+				// the surrounding Rescue can handle.
+				duro.WithMaxIterations(10),
 			),
 			duro.Sub("notify-fixed", notify("fixed")),
 		),

@@ -8,7 +8,10 @@ Every stage executes inside `dbos.RunAsStep` and checkpoints to Postgres; a
 crashed process resumes mid-pipeline, replaying completed stages from their
 checkpoints instead of re-running them. [samber/ro](https://github.com/samber/ro)
 is the reactive engine underneath; DBOS provides the durability. Both deps are
-pre-1.0 and pinned — keep dependencies to exactly those two (test-only deps OK).
+pre-1.0 and pinned — keep dependencies to those two, plus `jackc/pgx/v5` used
+**only** by worker-pool mode (`workerpool.go`/`client.go`), which needs a
+Postgres driver DBOS does not expose (pgx is already a transitive DBOS dep, so no
+new module enters the graph). Do not add a fourth. Test-only deps OK.
 
 ## Design philosophy (non-negotiable)
 
@@ -65,17 +68,26 @@ Single flat package at the repo root:
 
 - `duro.go` — `Stage`, step constructors (`Step`/`Tap`/`Filter`/`Expand`/
   `Reduce`/`Pure`/`UnsafeOperator`), step options (retries, timeout)
-- `pipe.go` — `Pipe1`…`Pipe8` → `Pipeline[P, R]`
+- `pipe.go` — `Pipe1`…`Pipe8` → `Pipeline[P, R]`, the shape fingerprint, and
+  the stage-name uniqueness check (`mustPipeline`)
+- `job.go` — `Job[P, R]`/`NewJob`: a pipeline's cross-process identity (name +
+  both types) shared by `RegisterJob`, `Enqueue`, and `AttachJob`
 - `run.go` — `Run`/`RunAll`, the hidden `duro.shape` checkpoint
 - `flow.go` — control flow: `Branch`/`Switch`/`When`/`Loop`/`Rescue`/`Sub`/`Via`/`Collect`
 - `fanout.go`, `parallel.go`, `queue.go` — `FanOut` + child options, `Parallel`, `NewQueue`
 - `channels.go`, `signals.go` — typed `Topic`/`Event`/`Stream`; `Delay`/`Send`/
   `Recv`/`SetEvent`/`GetEvent`/`ToStream`/`FromStream`
-- `app.go` — `App`, `Config`, `New`/`Launch`/`Shutdown`, stranded-run warning
+- `app.go` — `App`, `Config` (incl. `ApplicationVersion`/`ExecutorID`),
+  `New`/`Launch`/`Shutdown`, stranded-run warning
 - `register.go` — `Register`/`RegisterScheduled`/`RegisterDebounced`/
   `RegisterWorkflow`/`RegisterQueues`
 - `handle.go`, `status.go`, `fork.go` — `Handle`, `Status`/`StatusAll`/`Attach`,
-  `ForkFromStage`
+  `ForkFromStage`; `status.go` holds the shared `statusAll` mapping core
+- `workerpool.go` — worker-pool mode: `WithWorkerPool` (+ cadence options),
+  `WithRetention`, `WithStaleRunWarning`; the heartbeat lease, sweeper +
+  liveness takeover, retention, all on a dedicated pgx pool
+- `client.go` — enqueue-only `Client`: `NewClient`, generic `Enqueue`,
+  `Status`/`StatusAll` (reusing `status.go`'s mapping)
 
 ## Gotchas
 
@@ -90,6 +102,42 @@ Single flat package at the repo root:
   registered on every process start.
 - Embedded pipelines (`Branch`/`Switch`/`Loop`/`Rescue`/`Sub`/`Via` arms)
   fold into the shape fingerprint — editing an arm changes the fingerprint.
-- `go build` in `examples/` drops binaries (e.g. `housekeeping`) — don't
-  commit them.
+- **The shape fingerprint's exact text is on-disk format.** `stageKind` values,
+  the `fingerprint*Sep` separators, and the `branchThenKey`/`branchElseKey`
+  route keys all render into the checkpoint compared on every replay: change
+  one byte and every in-flight run built by the previous binary fails its shape
+  check forever. `shape_internal_test.go` holds golden fingerprints captured
+  from the released code — a diff there is a durability break, never a stale
+  expectation to update.
+- `Run` returns exactly one value: zero emissions is `ErrNoValue`, more than one
+  is `ErrMultipleValues`. Never "fix" that by picking a value — silently
+  dropping results is the foot gun it exists to prevent. Use `RunAll`, or fold
+  with `Reduce`/`Collect`.
+- Options that only some stages honor (`WithCancelSiblingSteps` → `Parallel`,
+  `WithMaxIterations` → `Loop`) must panic at construction on every other
+  constructor; see `resolveCancelSiblings`/`resolveLoopBound`. A new stage
+  constructor that accepts `StepOption` has to call both, or it silently
+  swallows an option the caller believes is in effect.
+- Worker-pool takeover (`workerpool.go`) issues its own SQL `UPDATE` against
+  DBOS's internal `dbos.workflow_status` table — a deliberate coupling to DBOS's
+  schema, pinned to the dbos module version. It is the only safe re-enqueue
+  (public `ResumeWorkflows` has a double-execution yank race and misses
+  NULL-`started_at` direct runs). It fails **loud** on schema drift (a renamed
+  column is an SQL error, surfaced in the sweep log and the R2b integration
+  tests) — re-verify it when bumping dbos. Two non-obvious invariants inside it:
+  it must **not** reset `recovery_attempts` (that is DBOS's poison-run circuit
+  breaker; zeroing it lets a process-killing run walk the fleet forever), and
+  queued runs are only adoptable because DBOS stamps `executor_id` and
+  `application_version` at dequeue (pinned by `TestTakeoverClientEnqueuedRun`).
+- Worker-pool housekeeping must never share the sweeper's advisory lock or run
+  unbounded work: takeover is the safety-critical path, and the maintenance
+  goroutine drives both. Retention deletes one batch per cycle under its own
+  lock, and every background query — duro's own and the DBOS-routed ones — is
+  deadline-bounded.
+- An **absent** heartbeat row means "unknown executor, do not touch its runs";
+  a **tombstoned** one (epoch timestamp) means "known-dead, adopt now". Lease
+  pruning therefore must skip executors that still own non-terminal runs, or
+  those runs become permanently unadoptable.
+- `go build` in `examples/` drops binaries (e.g. `housekeeping`, `fleet`) —
+  don't commit them.
 - Open an issue before behavior changes or new primitives (per CONTRIBUTING.md).

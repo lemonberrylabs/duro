@@ -79,6 +79,7 @@ func TestMain(m *testing.M) {
 	registerReadSideWorkflows(ctx)
 	registerFlowWorkflows(ctx)
 	registerCancelWorkflows(ctx)
+	registerGuardWorkflows(ctx)
 	registerPipelineWorkflows(app)
 	if err := registerFanOutOptionWorkflows(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "registering fan-out option workflows: %v\n", err)

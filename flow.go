@@ -16,6 +16,15 @@ import (
 // The embedded pipelines' shapes fold into the containing stage's
 // fingerprint, so editing an arm or body still trips the shape guard.
 
+// Branch renders as a two-case Switch, so its arms need route keys. They are
+// part of the shape fingerprint (each arm is recorded as "<key>=<arm shape>"),
+// which makes them duro's on-disk format: changing one invalidates the
+// recorded shape of every in-flight run containing a Branch.
+const (
+	branchThenKey = "then"
+	branchElseKey = "else"
+)
+
 // Case pairs a route key with the pipeline that handles it; see Switch.
 type Case[T, R any] struct {
 	key string
@@ -27,7 +36,7 @@ func When[T, R any](key string, p Pipeline[T, R]) Case[T, R] {
 	if key == "" {
 		panic("duro: When requires a non-empty case key")
 	}
-	mustValidEmbedded("When", key, p)
+	mustValidEmbedded(kindSwitch, key, p)
 	return Case[T, R]{key: key, p: p}
 }
 
@@ -37,47 +46,48 @@ func When[T, R any](key string, p Pipeline[T, R]) Case[T, R] {
 // no matching case fails the pipeline. Applied per item on multi-item
 // streams; every arm's outputs are emitted downstream in stream order.
 func Switch[T, R any](name string, route func(ctx context.Context, in T) (string, error), cases ...Case[T, R]) Stage[T, R] {
-	return dispatchStage("switch", name, route, cases, nil)
+	return dispatchStage(kindSwitch, name, route, cases, nil)
 }
 
 // Branch is durable two-way dispatch: the predicate runs as a checkpointed
 // step and each item flows through then or els accordingly. Both arms must
 // produce the same output type — the compiler holds routing honest.
 func Branch[T, R any](name string, pred func(ctx context.Context, in T) (bool, error), then, els Pipeline[T, R], opts ...StepOption) Stage[T, R] {
-	mustValidStage("Branch", name, pred == nil)
-	mustValidEmbedded("Branch", name, then)
-	mustValidEmbedded("Branch", name, els)
+	mustValidStage(kindBranch, name, pred == nil)
+	mustValidEmbedded(kindBranch, name, then)
+	mustValidEmbedded(kindBranch, name, els)
 	route := func(ctx context.Context, in T) (string, error) {
 		ok, err := pred(ctx, in)
 		if err != nil {
 			return "", err
 		}
 		if ok {
-			return "then", nil
+			return branchThenKey, nil
 		}
-		return "else", nil
+		return branchElseKey, nil
 	}
-	return dispatchStage("branch", name, route, []Case[T, R]{{key: "then", p: then}, {key: "else", p: els}}, opts)
+	return dispatchStage(kindBranch, name, route, []Case[T, R]{{key: branchThenKey, p: then}, {key: branchElseKey, p: els}}, opts)
 }
 
 // dispatchStage is the shared core of Switch and Branch: checkpoint the
 // routing decision, then run the chosen embedded pipeline for the item on
 // the workflow goroutine.
-func dispatchStage[T, R any](kind, name string, route func(ctx context.Context, in T) (string, error), cases []Case[T, R], opts []StepOption) Stage[T, R] {
+func dispatchStage[T, R any](kind stageKind, name string, route func(ctx context.Context, in T) (string, error), cases []Case[T, R], opts []StepOption) Stage[T, R] {
 	mustValidStage(kind, name, route == nil)
 	resolveCancelSiblings(kind, name, opts, false)
+	resolveLoopBound(kind, name, opts, false)
 	if len(cases) == 0 {
 		panic(fmt.Sprintf("duro: %s stage %q requires at least one case", kind, name))
 	}
 	byKey := make(map[string]Pipeline[T, R], len(cases))
-	nested := make([]string, 0, len(cases))
+	nested := make([]nestedShape, 0, len(cases))
 	var queues []Queue
 	for _, c := range cases {
 		if _, dup := byKey[c.key]; dup {
 			panic(fmt.Sprintf("duro: %s stage %q has duplicate case %q", kind, name, c.key))
 		}
 		byKey[c.key] = c.p
-		nested = append(nested, c.key+"="+c.p.fingerprint())
+		nested = append(nested, nestedShape{key: c.key, shape: c.p.shape})
 		queues = append(queues, c.p.queues...)
 	}
 	return Stage[T, R]{name: name, kind: kind, nested: nested, queues: queues, apply: func(source ro.Observable[T]) ro.Observable[R] {
@@ -133,10 +143,11 @@ func dispatchStage[T, R any](kind, name string, route func(ctx context.Context, 
 // resumes across restarts. Give the loop a natural bound (track attempts in
 // T and fail past a limit), or stop a runaway run with dbos.CancelWorkflow.
 func Loop[T any](name string, body Pipeline[T, T], until func(ctx context.Context, in T) (bool, error), opts ...StepOption) Stage[T, T] {
-	mustValidStage("Loop", name, until == nil)
-	resolveCancelSiblings("Loop", name, opts, false)
-	mustValidEmbedded("Loop", name, body)
-	return Stage[T, T]{name: name, kind: "loop", nested: []string{body.fingerprint()}, queues: body.queues, apply: func(source ro.Observable[T]) ro.Observable[T] {
+	mustValidStage(kindLoop, name, until == nil)
+	resolveCancelSiblings(kindLoop, name, opts, false)
+	maxIterations := resolveLoopBound(kindLoop, name, opts, true)
+	mustValidEmbedded(kindLoop, name, body)
+	return Stage[T, T]{name: name, kind: kindLoop, nested: []nestedShape{{shape: body.shape}}, queues: body.queues, apply: func(source ro.Observable[T]) ro.Observable[T] {
 		return ro.NewUnsafeObservableWithContext(func(subCtx context.Context, dest ro.Observer[T]) ro.Teardown {
 			failed := false
 			fail := func(ctx context.Context, err error) {
@@ -149,7 +160,12 @@ func Loop[T any](name string, body Pipeline[T, T], until func(ctx context.Contex
 						return
 					}
 					v := in
-					for {
+					// iteration is rebuilt by replay rather than carried across
+					// recovery: every completed iteration's body steps and
+					// predicate verdict replay from their checkpoints, so a
+					// recovered run arrives at the frontier with the same count
+					// the original run had, and the bound cannot reset.
+					for iteration := 1; ; iteration++ {
 						outs, err := collectSub(ctx, body, v)
 						if err != nil {
 							fail(ctx, err)
@@ -166,6 +182,10 @@ func Loop[T any](name string, body Pipeline[T, T], until func(ctx context.Contex
 						}
 						if done {
 							dest.NextWithContext(ctx, v)
+							return
+						}
+						if maxIterations > 0 && iteration >= maxIterations {
+							fail(ctx, fmt.Errorf("%w: stage %q ran %d iterations without its predicate reporting done", ErrMaxIterations, name, iteration))
 							return
 						}
 					}
@@ -213,10 +233,11 @@ func Loop[T any](name string, body Pipeline[T, T], until func(ctx context.Contex
 // wins — and Pipe1(Rescue(name, p, handler)) is the whole-pipeline except
 // block.
 func Rescue[T, R any](name string, p Pipeline[T, R], handler func(ctx context.Context, in T, cause error) (R, error), opts ...StepOption) Stage[T, R] {
-	mustValidStage("Rescue", name, handler == nil)
-	resolveCancelSiblings("Rescue", name, opts, false)
-	mustValidEmbedded("Rescue", name, p)
-	return Stage[T, R]{name: name, kind: "rescue", nested: []string{p.fingerprint()}, queues: p.queues, apply: func(source ro.Observable[T]) ro.Observable[R] {
+	mustValidStage(kindRescue, name, handler == nil)
+	resolveCancelSiblings(kindRescue, name, opts, false)
+	resolveLoopBound(kindRescue, name, opts, false)
+	mustValidEmbedded(kindRescue, name, p)
+	return Stage[T, R]{name: name, kind: kindRescue, nested: []nestedShape{{shape: p.shape}}, queues: p.queues, apply: func(source ro.Observable[T]) ro.Observable[R] {
 		return ro.NewUnsafeObservableWithContext(func(subCtx context.Context, dest ro.Observer[R]) ro.Teardown {
 			failed := false
 			fail := func(ctx context.Context, err error) {
@@ -272,11 +293,9 @@ func Rescue[T, R any](name string, p Pipeline[T, R], handler func(ctx context.Co
 // Sub applies to the whole stream, not per item: an embedded Reduce folds
 // everything flowing through it.
 func Sub[T, R any](name string, p Pipeline[T, R]) Stage[T, R] {
-	if name == "" {
-		panic("duro: Sub stage requires a non-empty name")
-	}
-	mustValidEmbedded("Sub", name, p)
-	return Stage[T, R]{name: name, kind: "sub", nested: []string{p.fingerprint()}, queues: p.queues, apply: p.apply}
+	mustValidStage(kindSub, name, false)
+	mustValidEmbedded(kindSub, name, p)
+	return Stage[T, R]{name: name, kind: kindSub, nested: []nestedShape{{shape: p.shape}}, queues: p.queues, apply: p.apply}
 }
 
 // Via runs the embedded pipeline for each item — durably, to completion —
@@ -301,11 +320,9 @@ func Sub[T, R any](name string, p Pipeline[T, R]) Stage[T, R] {
 // fan-out that continues with the original item either way. Applied per item
 // on multi-item streams, in stream order.
 func Via[T, R any](name string, p Pipeline[T, R]) Stage[T, T] {
-	if name == "" {
-		panic("duro: Via stage requires a non-empty name")
-	}
-	mustValidEmbedded("Via", name, p)
-	return Stage[T, T]{name: name, kind: "via", nested: []string{p.fingerprint()}, queues: p.queues, apply: ro.FlatMapWithContext(func(ctx context.Context, in T) ro.Observable[T] {
+	mustValidStage(kindVia, name, false)
+	mustValidEmbedded(kindVia, name, p)
+	return Stage[T, T]{name: name, kind: kindVia, nested: []nestedShape{{shape: p.shape}}, queues: p.queues, apply: ro.FlatMapWithContext(func(ctx context.Context, in T) ro.Observable[T] {
 		if _, err := collectSub(ctx, p, in); err != nil {
 			return ro.Throw[T](err)
 		}
@@ -317,11 +334,13 @@ func Via[T, R any](name string, p Pipeline[T, R]) Stage[T, T] {
 // standard final stage for a registered pipeline that should return all
 // values rather than the last one. An empty stream yields an empty slice.
 func Collect[T any](name string, opts ...StepOption) Stage[T, []T] {
-	resolveCancelSiblings("Collect", name, opts, false)
+	mustValidStage(kindCollect, name, false)
+	resolveCancelSiblings(kindCollect, name, opts, false)
+	resolveLoopBound(kindCollect, name, opts, false)
 	s := Reduce(name, func(_ context.Context, acc []T, v T) ([]T, error) {
 		return append(acc, v), nil
 	}, nil, opts...)
-	s.kind = "collect"
+	s.kind = kindCollect
 	return s
 }
 
@@ -363,7 +382,7 @@ func collectSub[T, R any](ctx context.Context, p Pipeline[T, R], in T) ([]R, err
 
 // mustValidEmbedded panics when a control-flow stage is given a zero-value
 // pipeline.
-func mustValidEmbedded[P, R any](kind, name string, p Pipeline[P, R]) {
+func mustValidEmbedded[P, R any](kind stageKind, name string, p Pipeline[P, R]) {
 	if p.apply == nil {
 		panic(fmt.Sprintf("duro: %s %q requires pipelines built by Pipe1..Pipe8", kind, name))
 	}

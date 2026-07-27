@@ -80,11 +80,30 @@ func Status(ctx Context, workflowID string) (RunStatus, error) {
 // recorded errors are fetched in a second query scoped to just those runs —
 // healthy polling stays cheap, failure reasons still surface.
 func StatusAll(ctx Context, workflowIDs ...string) ([]RunStatus, error) {
+	dctx := unwrapContext(ctx)
+	return statusAll(func(opts ...dbos.ListWorkflowsOption) ([]dbos.WorkflowStatus, error) {
+		return dbos.ListWorkflows(dctx, opts...)
+	}, workflowIDs)
+}
+
+// workflowLister is the one operation the status mapping needs from its data
+// source; both the engine (dbos.ListWorkflows) and the client
+// (dbos.Client.ListWorkflows) supply it.
+type workflowLister func(...dbos.ListWorkflowsOption) ([]dbos.WorkflowStatus, error)
+
+// statusAll is the shared status-mapping core behind both StatusAll and
+// Client.StatusAll, so engine and client consumers can never diverge on how
+// DBOS statuses map to duro states or on what counts as terminal.
+//
+// The common case is one payload-free query. DBOS stores a run's failure
+// message alongside its output, so when the batch contains failed runs their
+// recorded errors are fetched in a second query scoped to just those runs —
+// healthy polling stays cheap, failure reasons still surface.
+func statusAll(list workflowLister, workflowIDs []string) ([]RunStatus, error) {
 	if len(workflowIDs) == 0 {
 		return nil, nil
 	}
-	dctx := unwrapContext(ctx)
-	found, err := dbos.ListWorkflows(dctx,
+	found, err := list(
 		dbos.WithWorkflowIDs(workflowIDs),
 		dbos.WithLoadInput(false),
 		dbos.WithLoadOutput(false),
@@ -103,7 +122,7 @@ func StatusAll(ctx Context, workflowIDs ...string) ([]RunStatus, error) {
 		}
 	}
 	if len(failedIDs) > 0 {
-		failed, err := dbos.ListWorkflows(dctx,
+		failed, err := list(
 			dbos.WithWorkflowIDs(failedIDs),
 			dbos.WithLoadInput(false), // loadOutput stays on: it carries the recorded error
 		)
@@ -128,9 +147,18 @@ func StatusAll(ctx Context, workflowIDs ...string) ([]RunStatus, error) {
 	return out, nil
 }
 
+// AttachJob is Attach with the result type taken from a Job rather than
+// written out at the call site, so it cannot drift from the registration. Use
+// it whenever the run belongs to a job you declared.
+func AttachJob[P, R any](ctx Context, job Job[P, R], workflowID string) (Handle[R], error) {
+	mustValidJob("AttachJob", job)
+	return Attach[R](ctx, workflowID)
+}
+
 // Attach reconnects to an existing run by workflow ID and returns its
 // handle — how a restarted process awaits a result instead of just polling
-// Status. R must match the workflow's result type.
+// Status. R must match the workflow's result type; prefer AttachJob, which
+// takes it from the job's declaration instead.
 func Attach[R any](ctx Context, workflowID string) (Handle[R], error) {
 	h, err := dbos.RetrieveWorkflow[R](unwrapContext(ctx), workflowID)
 	if err != nil {
