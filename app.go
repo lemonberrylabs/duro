@@ -158,6 +158,13 @@ func (a *App) Launch() error {
 // adopted by a survivor on its next sweep with no stale wait. Follow Shutdown
 // promptly with process exit.
 //
+// timeout bounds the drain. The two steps around it are bounded separately and
+// take milliseconds against a healthy database: stopping maintenance cancels
+// whatever query it has in flight rather than waiting it out, and the tombstone
+// is a single primary-key UPDATE bounded by a few seconds of its own. Budget
+// timeout plus a small constant for the whole call — never let timeout consume
+// the entire SIGTERM grace period, or the tombstone is the part that is lost.
+//
 // Calling Shutdown more than once is safe; the extra calls do nothing.
 func (a *App) Shutdown(timeout time.Duration) {
 	if a.wp != nil {

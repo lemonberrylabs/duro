@@ -632,6 +632,73 @@ func TestTakeoverHeartbeatThroughDrain(t *testing.T) {
 	<-done // A finishes draining and tombstones
 }
 
+// wpLimitedQueue carries the queue-preservation case: a concurrency-limited
+// queue, so a run re-enqueued anywhere else would execute outside the limit.
+var wpLimitedQueue = NewQueue("wp-limited-queue", WithConcurrency(1))
+
+// TestTakeoverReturnsRunToItsQueue is the live-fleet half of
+// TestTakeoverPreservesQueue: a pipeline enqueued on a concurrency-limited
+// queue, taken over mid-run, must be re-enqueued on that same queue and run to
+// completion from there — not shunted onto the internal queue, where it would
+// execute outside the limit the queue exists to enforce.
+func TestTakeoverReturnsRunToItsQueue(t *testing.T) {
+	wpResetBlocker()
+	t.Cleanup(wpReleaseBlocker)
+
+	appA, wfA := newWPWorker(t, "wp-queue-A", wpIVersion)
+	appB, _ := newWPWorker(t, "wp-queue-B", wpIVersion)
+	for _, a := range []*App{appA, appB} {
+		if err := RegisterQueues(a, wpLimitedQueue); err != nil {
+			t.Fatalf("register queue: %v", err)
+		}
+	}
+
+	h, err := wfA.Start(appA, 5, dbos.WithQueue(wpLimitedQueue.Name()))
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	runID := h.ID()
+
+	waitUntil(t, 20*time.Second, "a worker to reach the block step", func() bool { return wpBlockCount.Load() >= 1 })
+
+	// Either worker may have dequeued it, so kill whichever owns it.
+	conn := wpConnFor(t)
+	var owner string
+	if err := conn.QueryRow(context.Background(),
+		"SELECT executor_id FROM dbos.workflow_status WHERE workflow_uuid=$1", runID).Scan(&owner); err != nil {
+		t.Fatalf("reading owner: %v", err)
+	}
+	survivor := appB
+	if owner == "wp-queue-B" {
+		crashApp(appB)
+		survivor = appA
+	} else {
+		crashApp(appA)
+	}
+	defer survivor.Shutdown(5 * time.Second)
+	wpReleaseBlocker()
+
+	waitState(t, survivor, runID, StateSuccess, 20*time.Second)
+
+	// Completion leaves queue_name alone, so the row still records where the
+	// adopted run was dispatched from.
+	var queue string
+	if err := conn.QueryRow(context.Background(),
+		"SELECT queue_name FROM dbos.workflow_status WHERE workflow_uuid=$1", runID).Scan(&queue); err != nil {
+		t.Fatalf("reading queue: %v", err)
+	}
+	if queue != wpLimitedQueue.Name() {
+		t.Errorf("queue_name = %q after takeover, want %q — the adopted run left its concurrency-limited queue and ran outside the limit",
+			queue, wpLimitedQueue.Name())
+	}
+	if n := wpPreCount.Load(); n != 1 {
+		t.Errorf("wp-pre executions = %d, want 1 (checkpoint replayed on takeover)", n)
+	}
+	if n := wpPostCount.Load(); n != 1 {
+		t.Errorf("wp-post executions = %d, want 1 (completed exactly once)", n)
+	}
+}
+
 // TestTakeoverFanOutCombination is the CLAUDE.md combination case: a
 // direct-started parent that fans out onto a queue is taken over mid-run. The
 // survivor must adopt the parent and complete it while replaying the already-
@@ -796,6 +863,99 @@ func TestTakeoverEligibility(t *testing.T) {
 	for _, id := range again {
 		if want[id] {
 			t.Errorf("second takeover re-adopted %s — not idempotent", id)
+		}
+	}
+}
+
+// seedQueuedWorkflow seeds a PENDING run with an explicit queue_name — SQL NULL
+// when queue is nil — so takeover's queue handling can be driven across all
+// three shapes a real row takes.
+func seedQueuedWorkflow(t *testing.T, pool *pgxpool.Pool, id, execID, ver string, queue *string) {
+	t.Helper()
+	_, err := pool.Exec(context.Background(),
+		`INSERT INTO dbos.workflow_status (workflow_uuid, status, executor_id, application_version, queue_name)
+		 VALUES ($1,'PENDING',$2,$3,$4)
+		 ON CONFLICT (workflow_uuid) DO UPDATE SET
+		   status='PENDING', executor_id=EXCLUDED.executor_id,
+		   application_version=EXCLUDED.application_version, queue_name=EXCLUDED.queue_name`,
+		id, execID, ver, queue)
+	if err != nil {
+		t.Fatalf("seed queued workflow %s: %v", id, err)
+	}
+}
+
+// TestTakeoverPreservesQueue proves an adopted run goes back on the queue it came
+// from, and that only a run with no queue falls back to the internal one.
+//
+// Rewriting every adoption onto the internal queue (as DBOS's resume does) would
+// exempt the run from its queue's concurrency and rate limits — silently, and
+// only under recovery, which is exactly when nobody is looking.
+//
+// The empty-string case is the one that bites: DBOS stores the empty string,
+// not NULL, for a directly started run, so a plain COALESCE would leave those
+// adopted runs ENQUEUED under an empty queue name that no queue runner polls —
+// stranded forever by the sweep meant to rescue them.
+func TestTakeoverPreservesQueue(t *testing.T) {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, wpURL())
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	defer pool.Close()
+
+	const app, ver = "r2a-queue-app", "r2a-queue-v1"
+	wp := &workerPool{pool: pool, logger: wpLogger(), appName: app, version: ver, staleThreshold: 5 * time.Minute}
+	if err := wp.ensureTable(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		pool.Exec(ctx, "DELETE FROM dbos.workflow_status WHERE workflow_uuid LIKE 'r2a-queue-%'")
+		pool.Exec(ctx, "DELETE FROM dbos.duro_executor_heartbeats WHERE executor_id LIKE 'r2a-queue-%'")
+	})
+
+	seedHeartbeat(t, pool, "r2a-queue-dead", app, ver, time.Now().Add(-10*time.Minute))
+
+	limited, empty, internal := "r2a-queue-limited", "", internalQueueName
+	cases := []struct {
+		id   string
+		seed *string
+		want string
+		why  string
+	}{
+		{"r2a-queue-named", &limited, limited, "a queued run must return to its own queue, or it runs outside that queue's limits"},
+		{"r2a-queue-empty", &empty, internalQueueName, "a directly started run stores '' and has no queue to return to"},
+		{"r2a-queue-null", nil, internalQueueName, "the NULL variant of a run with no queue"},
+		{"r2a-queue-internal", &internal, internalQueueName, "a run already on the internal queue stays there"},
+	}
+	for _, c := range cases {
+		seedQueuedWorkflow(t, pool, c.id, "r2a-queue-dead", ver, c.seed)
+	}
+
+	adopted, err := wp.takeover(ctx, pool)
+	if err != nil {
+		t.Fatalf("takeover: %v", err)
+	}
+	got := map[string]bool{}
+	for _, id := range adopted {
+		got[id] = true
+	}
+
+	for _, c := range cases {
+		if !got[c.id] {
+			t.Errorf("run %s was not adopted", c.id)
+			continue
+		}
+		var queue, status string
+		if err := pool.QueryRow(ctx,
+			"SELECT queue_name, status FROM dbos.workflow_status WHERE workflow_uuid=$1", c.id).
+			Scan(&queue, &status); err != nil {
+			t.Fatalf("reading %s: %v", c.id, err)
+		}
+		if queue != c.want {
+			t.Errorf("run %s: queue_name = %q after takeover, want %q — %s", c.id, queue, c.want, c.why)
+		}
+		if status != string(dbos.WorkflowStatusEnqueued) {
+			t.Errorf("run %s: status = %q, want ENQUEUED", c.id, status)
 		}
 	}
 }

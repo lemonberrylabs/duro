@@ -29,9 +29,9 @@ func newMaintenanceApp(t *testing.T, version string) *App {
 		t.Fatalf("New maintenance app: %v", err)
 	}
 	// These tests drive the checks directly rather than launching (which would
-	// start the periodic loop). Give the worker pool the maintenance context its
+	// start the periodic loop). Give the worker pool the maintenance contexts its
 	// methods bound their per-operation timeouts to.
-	a.wp.maintCtx, a.wp.maintCancel = context.WithCancel(context.Background())
+	a.wp.initMaintContexts()
 	t.Cleanup(func() { a.Shutdown(5 * time.Second) })
 	return a
 }
@@ -208,6 +208,49 @@ func TestMaintenanceLoopWithoutWorkerPool(t *testing.T) {
 	}
 	if !rowExists(t, pool, "r45-limbo") {
 		t.Error("retention deleted a non-terminal run")
+	}
+}
+
+// TestMaintenanceDBOSCallsObserveStopMaintenance proves the maintenance duties
+// that run through DBOS — retention's list/delete and the stale-run aggregate —
+// hang off the maintenance scope rather than the app's DBOS context.
+//
+// The failure it guards is a Shutdown-latency one, so it is asserted at the
+// wiring rather than by hanging a query: if these calls ignore the maintenance
+// scope, a query already in flight runs on to its own 30s opTimeout while
+// Shutdown blocks on maintWG — spending the caller's SIGTERM budget before
+// DBOS's drain has even begun, and typically costing the shutdown tombstone
+// that lets survivors adopt undrained runs without a stale wait.
+func TestMaintenanceDBOSCallsObserveStopMaintenance(t *testing.T) {
+	app := newMaintenanceApp(t, "maint-ctx-version")
+
+	// Both duties work while the scope is live.
+	if _, err := app.wp.checkStaleRuns(); err != nil {
+		t.Fatalf("checkStaleRuns before cancellation: %v", err)
+	}
+	if _, err := app.wp.sweepRetention(); err != nil {
+		t.Fatalf("sweepRetention before cancellation: %v", err)
+	}
+
+	// Cancel only the DBOS half, leaving maintCtx live: any failure below can
+	// then only come from the DBOS-routed calls — the ones that used to run on
+	// the app context and ignore cancellation entirely.
+	app.wp.maintDctxCancel()
+
+	if _, err := app.wp.checkStaleRuns(); err == nil {
+		t.Error("checkStaleRuns succeeded after the maintenance DBOS context was cancelled — its aggregate query runs on the app context and will hold Shutdown open")
+	}
+	if _, err := app.wp.sweepRetention(); err == nil {
+		t.Error("sweepRetention succeeded after the maintenance DBOS context was cancelled — its list/delete run on the app context and will hold Shutdown open")
+	}
+
+	// And stopMaintenance is what cancels it in production, not just this test.
+	app2 := newMaintenanceApp(t, "maint-ctx-version-2")
+	app2.wp.stopMaintenance()
+	select {
+	case <-app2.wp.maintDctx.Done():
+	default:
+		t.Error("stopMaintenance left the maintenance DBOS context live: an in-flight retention or stale-run query would keep running while Shutdown waits for the maintenance goroutine")
 	}
 }
 

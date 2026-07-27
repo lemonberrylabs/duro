@@ -124,16 +124,28 @@ Single flat package at the repo root:
   (public `ResumeWorkflows` has a double-execution yank race and misses
   NULL-`started_at` direct runs). It fails **loud** on schema drift (a renamed
   column is an SQL error, surfaced in the sweep log and the R2b integration
-  tests) — re-verify it when bumping dbos. Two non-obvious invariants inside it:
-  it must **not** reset `recovery_attempts` (that is DBOS's poison-run circuit
-  breaker; zeroing it lets a process-killing run walk the fleet forever), and
+  tests) — re-verify it when bumping dbos. Three non-obvious invariants inside
+  it: it must **not** reset `recovery_attempts` (that is DBOS's poison-run
+  circuit breaker; zeroing it lets a process-killing run walk the fleet forever);
   queued runs are only adoptable because DBOS stamps `executor_id` and
-  `application_version` at dequeue (pinned by `TestTakeoverClientEnqueuedRun`).
+  `application_version` at dequeue (pinned by `TestTakeoverClientEnqueuedRun`);
+  and `queue_name` follows DBOS's *recovery*, not its *resume* — an adopted run
+  goes back on its own queue (`COALESCE(NULLIF(queue_name, ''), internal)`) or it
+  escapes that queue's concurrency and rate limits. The `NULLIF` is load-bearing:
+  DBOS stores `''`, not NULL, for a directly started run, so a plain `COALESCE`
+  strands those runs `ENQUEUED` on a queue nobody polls. Both halves are pinned
+  by `TestTakeoverPreservesQueue` and `TestTakeoverReturnsRunToItsQueue`.
 - Worker-pool housekeeping must never share the sweeper's advisory lock or run
   unbounded work: takeover is the safety-critical path, and the maintenance
   goroutine drives both. Retention deletes one batch per cycle under its own
   lock, and every background query — duro's own and the DBOS-routed ones — is
   deadline-bounded.
+- Every maintenance database call must hang off the maintenance scope: pgx ones
+  off `maintCtx`, DBOS-routed ones off `maintDctx` (`initMaintContexts`). One
+  built from the app's DBOS context compiles and works, but ignores
+  `stopMaintenance` — so `Shutdown` blocks on `maintWG` for a full `opTimeout`
+  before the drain starts, usually costing the tombstone. Pinned by
+  `TestMaintenanceDBOSCallsObserveStopMaintenance`.
 - An **absent** heartbeat row means "unknown executor, do not touch its runs";
   a **tombstoned** one (epoch timestamp) means "known-dead, adopt now". Lease
   pruning therefore must skip executors that still own non-terminal runs, or

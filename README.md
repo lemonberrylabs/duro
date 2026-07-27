@@ -529,13 +529,22 @@ app, err := duro.New(ctx, duro.Config{
 Enable it on **every** worker in the fleet. A killed worker's run resumes on a
 survivor within the stale threshold plus one sweep; a graceful `Shutdown`
 tombstones the lease so undrained runs are taken over on the next sweep with no
-wait. Takeover guarantees exactly-once workflow completion but, like all DBOS
-recovery, at-least-once step side effects — keep steps idempotent. Tune the
+wait. A run taken over goes back on the queue it came from, so it stays subject
+to that queue's concurrency and rate limits; only a run started directly (which
+has no queue) is re-enqueued on DBOS's internal queue. Takeover guarantees
+exactly-once workflow completion but, like all DBOS recovery, at-least-once step
+side effects — keep steps idempotent. Tune the
 cadence (defaults: 10s heartbeat / 60s stale / 30s sweep) with
 `WithHeartbeatInterval`, `WithStaleThreshold`, `WithSweepInterval`; `New` rejects
 a stale threshold under 2× the heartbeat interval, since a threshold that tight
 declares merely-slow workers dead and runs their live work twice. Leave real
 headroom for GC pauses — the defaults are 6×.
+
+`Shutdown`'s timeout bounds the drain; stopping maintenance and writing the
+tombstone are bounded separately and take milliseconds on a healthy database. Do
+not set the timeout to your whole SIGTERM grace period — the tombstone is written
+last, so it is what a `SIGKILL` takes away, and losing it costs the fast adoption
+of exactly the runs that could not drain.
 
 ### Identity: application version and executor ID
 

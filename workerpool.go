@@ -44,14 +44,24 @@ const (
 	// Generous on purpose — the operations take milliseconds.
 	opTimeout = 30 * time.Second
 
+	// tombstoneTimeout bounds the shutdown tombstone, and is deliberately far
+	// tighter than opTimeout. The tombstone is the one operation that runs after
+	// DBOS's drain, past the point App.Shutdown's timeout covers, so every second
+	// it takes overruns the process's SIGTERM budget. It is a single-row
+	// primary-key UPDATE: if it cannot land in this long the database is
+	// unhealthy, and waiting longer buys nothing the stale-threshold fallback
+	// does not already cover.
+	tombstoneTimeout = 5 * time.Second
+
 	// heartbeatTable is duro's own liveness table, created in the dbos schema
 	// alongside DBOS's tables so it is dropped and backed up together with them.
 	heartbeatTable = "dbos.duro_executor_heartbeats"
 
 	// internalQueueName is DBOS's internal queue (dbos queue.go
-	// _DBOS_INTERNAL_QUEUE_NAME). A taken-over run is re-enqueued here, where any
-	// live worker's queue runner picks it up — the same queue DBOS's own resume
-	// uses.
+	// _DBOS_INTERNAL_QUEUE_NAME), which every process runs a queue runner for. A
+	// taken-over run that has no queue of its own — a directly started pipeline —
+	// is re-enqueued here, where any live worker picks it up. Runs that came from
+	// a queue go back on theirs; see takeoverSQL.
 	internalQueueName = "_dbos_internal_queue"
 )
 
@@ -253,12 +263,21 @@ type workerPool struct {
 	// retention, and stale-run-warning goroutines. They are separate so
 	// Shutdown can stop maintenance first yet keep heartbeating through DBOS's
 	// drain (so this node's still-executing runs stay fresh and un-takeable).
-	beatCtx     context.Context
-	beatCancel  context.CancelFunc
-	beatWG      sync.WaitGroup
-	maintCtx    context.Context
-	maintCancel context.CancelFunc
-	maintWG     sync.WaitGroup
+	//
+	// maintDctx is the DBOS-side half of maintCtx. The maintenance duties that
+	// go through DBOS (retention's list and delete, the stale-run aggregate)
+	// need a DBOSContext, and one derived from the app's would not observe
+	// maintCancel at all — a query already in flight would then run to its own
+	// opTimeout while Shutdown waited on maintWG, burning the caller's SIGTERM
+	// budget before DBOS's drain even started. stopMaintenance cancels both.
+	beatCtx         context.Context
+	beatCancel      context.CancelFunc
+	beatWG          sync.WaitGroup
+	maintCtx        context.Context
+	maintCancel     context.CancelFunc
+	maintDctx       dbos.DBOSContext
+	maintDctxCancel context.CancelFunc
+	maintWG         sync.WaitGroup
 
 	// closeOnce keeps a second Shutdown from tombstoning against a closed pool.
 	closeOnce sync.Once
@@ -390,7 +409,7 @@ func (w *workerPool) beat(ctx context.Context) error {
 // The nonce predicate keeps a departing process from tombstoning a lease another
 // process has since claimed — which would declare a live executor dead.
 func (w *workerPool) tombstone(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, opTimeout)
+	ctx, cancel := context.WithTimeout(ctx, tombstoneTimeout)
 	defer cancel()
 	_, err := w.pool.Exec(ctx, `UPDATE `+heartbeatTable+`
 		SET last_heartbeat = to_timestamp(0) WHERE executor_id = $1 AND nonce = $2`,
@@ -412,13 +431,22 @@ func (w *workerPool) firstBeat(ctx context.Context) error {
 // under maintCtx.
 func (w *workerPool) start() {
 	w.beatCtx, w.beatCancel = context.WithCancel(context.Background())
-	w.maintCtx, w.maintCancel = context.WithCancel(context.Background())
+	w.initMaintContexts()
 
 	if w.enabled {
 		w.beatWG.Add(1)
 		go w.heartbeatLoop()
 	}
 	w.startMaintenance()
+}
+
+// initMaintContexts derives both halves of the maintenance scope. Every
+// maintenance database call must hang off one of them — the pgx ones off
+// maintCtx, the DBOS-routed ones off maintDctx — so stopMaintenance aborts
+// whatever is in flight instead of waiting it out.
+func (w *workerPool) initMaintContexts() {
+	w.maintCtx, w.maintCancel = context.WithCancel(context.Background())
+	w.maintDctx, w.maintDctxCancel = dbos.WithCancel(w.dctx)
 }
 
 func (w *workerPool) heartbeatLoop() {
@@ -549,8 +577,8 @@ func (w *workerPool) sweepOnce(ctx context.Context) (int, error) {
 
 // takeoverSQL re-enqueues the PENDING runs of dead executors on this app's
 // application version. It mirrors DBOS's own resume (system_database.go
-// resumeWorkflows) — the same column writes, the same internal queue — but adds
-// the executor_id and application_version predicates that make it safe:
+// resumeWorkflows) — largely the same column writes — but adds the executor_id
+// and application_version predicates that make it safe:
 //
 //   - The ownership check runs atomically under the rows' locks, so a run a live
 //     executor has already re-claimed (its executor_id no longer among the dead
@@ -558,6 +586,27 @@ func (w *workerPool) sweepOnce(ctx context.Context) (int, error) {
 //     that raw dbos.ResumeWorkflows would open.
 //   - Gating on liveness (heartbeat staleness), not dequeue time, covers
 //     directly-started pipelines, whose started_at_epoch_ms is NULL.
+//
+// The queue is where it follows DBOS's *recovery* rather than its resume.
+// Recovery (recovery.go's clearQueueAssignment) leaves queue_name alone, so a
+// recovered run goes back on its own queue; resume rewrites it to the internal
+// queue, which is why resume grew a WithResumeQueue option. Sending an adopted
+// run to the internal queue would exempt it from its queue's concurrency and
+// rate limits and stop it counting against them — enough for a
+// WithConcurrency(1) queue to have two runs executing at once — and would drop
+// a partitioned queue's run out of its partition. So the queue is preserved
+// when there is one, and the internal queue is the fallback for the runs that
+// have none (a directly-started pipeline has no queue to return to, and
+// nothing but a queue runner can restart it from here).
+//
+// NULLIF is load-bearing: DBOS writes the empty string, not NULL, as the queue
+// of a directly started run, so a plain COALESCE would leave those runs
+// ENQUEUED under an empty queue name, which no queue runner polls. They would
+// be stranded permanently, by the very sweep meant to rescue them.
+//
+// Preserving the queue does assume some live executor on this application
+// version polls it. That holds by construction for pipelines: Register
+// registers every queue its pipeline references, on every process.
 //
 // It deliberately does NOT reset recovery_attempts, where it parts company with
 // DBOS's resume. Resume is a deliberate operator action; takeover is an
@@ -573,7 +622,7 @@ func (w *workerPool) sweepOnce(ctx context.Context) (int, error) {
 // module version); a column rename fails this UPDATE loudly rather than
 // corrupting anything silently.
 const takeoverSQL = `UPDATE dbos.workflow_status
-	SET status = $1, queue_name = $2,
+	SET status = $1, queue_name = COALESCE(NULLIF(queue_name, ''), $2),
 	    workflow_deadline_epoch_ms = NULL, deduplication_id = NULL,
 	    started_at_epoch_ms = NULL, updated_at = $3, completed_at = NULL
 	WHERE status = $4
@@ -704,7 +753,7 @@ func (w *workerPool) runStaleRunWarning() {
 // DELAYED runs are deliberately excluded: a debounced pipeline parks there by
 // design, so counting them would report healthy work as stranded.
 func (w *workerPool) checkStaleRuns() (StaleRunInfo, error) {
-	ctx, cancel := dbos.WithTimeout(w.dctx, opTimeout)
+	ctx, cancel := dbos.WithTimeout(w.maintDctx, opTimeout)
 	defer cancel()
 
 	rows, err := dbos.GetWorkflowAggregates(ctx, dbos.GetWorkflowAggregatesInput{
@@ -766,7 +815,7 @@ func (w *workerPool) sweepRetention() (int, error) {
 
 	deleted := 0
 	_, err := w.withLock(ctx, w.retentionLockKey(), func(pgx.Tx) error {
-		dctx, dcancel := dbos.WithTimeout(w.dctx, opTimeout)
+		dctx, dcancel := dbos.WithTimeout(w.maintDctx, opTimeout)
 		defer dcancel()
 
 		terminal, err := dbos.ListWorkflows(dctx,
@@ -802,9 +851,16 @@ func (w *workerPool) sweepRetention() (int, error) {
 
 // stopMaintenance stops the sweeper and other maintenance goroutines, leaving
 // the heartbeat running (Shutdown keeps beating through DBOS's drain).
+//
+// It cancels both halves of the maintenance scope, so a database call already
+// in flight is aborted rather than waited out: Shutdown returns to draining
+// promptly instead of holding for an operation timeout first.
 func (w *workerPool) stopMaintenance() {
 	if w.maintCancel != nil {
 		w.maintCancel()
+	}
+	if w.maintDctxCancel != nil {
+		w.maintDctxCancel()
 	}
 	w.maintWG.Wait()
 }

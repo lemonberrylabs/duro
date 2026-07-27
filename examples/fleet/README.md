@@ -24,6 +24,7 @@ across terminals you can watch work move between workers.
 | `NewClient` + `Enqueue` | `-role=web` starts a run with no engine and polls `Client.Status` |
 | `NewJob` + `RegisterJob` | `resizeJob` declares the name and both types once; the workers register it and the web tier enqueues it |
 | `WithStaleRunWarning` | workers warn about non-terminal runs older than 15s |
+| Queue-preserving takeover | `resize-jobs` is capped at `WithConcurrency(2)`; an adopted run returns to it, so a crash cannot exceed the cap |
 
 The cadences here are fast for the demo (1s heartbeat / 5s stale / 2s sweep); the
 production defaults are 10s / 60s / 30s.
@@ -72,5 +73,14 @@ checkpoint replays instead of re-running. Exactly-once completion; the in-flight
 `resize` step is the only one that runs twice (at-least-once — keep steps
 idempotent).
 
+The adopted run comes back on `resize-jobs`, the queue it was enqueued on, not on
+DBOS's internal queue — so it still counts against that queue's
+`WithConcurrency(2)` cap. A run that changed queues during recovery would run
+outside the limit its queue exists to enforce, and would stop counting toward it,
+which is exactly when nobody is watching.
+
 For the graceful path, stop a worker with Ctrl-C instead: it tombstones its lease
 so any run it could not drain is taken over on the next sweep with no stale wait.
+`Shutdown`'s timeout bounds the drain; the tombstone is written after it, so give
+the process a little grace beyond that timeout or a `SIGKILL` takes the tombstone
+away and survivors fall back to waiting out the stale threshold.

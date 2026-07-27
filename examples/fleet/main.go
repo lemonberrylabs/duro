@@ -21,8 +21,11 @@ import (
 // runs. In production this would be a git SHA or release tag.
 const appVersion = "v1"
 
-// resizeQueue is the queue the web tier enqueues onto and every worker listens on.
-var resizeQueue = duro.NewQueue("resize-jobs")
+// resizeQueue is the queue the web tier enqueues onto and every worker listens
+// on. The concurrency cap is what makes takeover's queue handling visible: an
+// adopted run is re-enqueued on this queue, not shunted onto DBOS's internal
+// one, so a crash cannot let the fleet exceed the limit set here.
+var resizeQueue = duro.NewQueue("resize-jobs", duro.WithConcurrency(2))
 
 // resizeJob is the pipeline's cross-process identity: the workers register it
 // and the web tier enqueues it, so the name and both types come from this one
