@@ -175,8 +175,8 @@ func WithChildTimeout(d time.Duration) ChildOption {
 //
 // Nor does cancellation depend on this process surviving the await:
 // alongside the batch, the stage enqueues duro's cancellation watcher — an
-// internal durable workflow (registered by New as "duro.cancel-watcher" on
-// the internal "duro.cancel-watch" queue; both names are durable identities)
+// internal durable workflow (registered by New as CancelWatcherName on the
+// internal CancelWatchQueueName queue; both names are durable identities)
 // that watches the same children and cancels redundantly. Any executor can
 // dequeue or recover the watcher, so a failure is acted on even when the
 // parent's executor dies mid-await. The stage requires the watcher to be
@@ -382,7 +382,7 @@ func FanOut[T, R any](name string, queue Queue, wf WorkflowRef[T, R], opts ...Ch
 							interval = defaultCancelWatchPollInterval
 						}
 						watch := cancelWatchInput{Stage: name, WorkflowIDs: uniqueWorkflowIDs(ids), PollInterval: interval}
-						if _, err := dbos.RunWorkflow(state.dctx, cancelWatcher, watch, dbos.WithQueue(cancelWatchQueueName)); err != nil {
+						if _, err := dbos.RunWorkflow(state.dctx, cancelWatcher, watch, dbos.WithQueue(CancelWatchQueueName)); err != nil {
 							state.aborted.Store(true)
 							fail(ctx, fmt.Errorf("duro: stage %q: enqueueing the cancellation watcher (built the app with duro.New, which registers it?): %w", name, err))
 							return
@@ -442,8 +442,17 @@ const fanOutCancelPollInterval = 250 * time.Millisecond
 // the watcher workflow and its queue on every app; both names are durable
 // identities and must never change.
 const (
-	cancelWatcherName    = "duro.cancel-watcher"
-	cancelWatchQueueName = "duro.cancel-watch"
+	// CancelWatcherName is the registered workflow name of duro's cancellation
+	// watcher. Watcher runs are ordinary rows in the system database — one per
+	// cancel-enabled FanOut batch — so they appear in ListRuns alongside
+	// application runs; filter them in or out with WithNames(CancelWatcherName).
+	// A watcher stuck non-terminal is worth an operator's attention. The name
+	// is a durable identity: it never changes.
+	CancelWatcherName = "duro.cancel-watcher"
+	// CancelWatchQueueName is the duro-owned queue watcher runs execute on
+	// (WithQueue(CancelWatchQueueName) lists them by queue). Also a durable
+	// identity.
+	CancelWatchQueueName = "duro.cancel-watch"
 	// The backstop cadence; the parent's await polls faster, and a stage can
 	// tune this with WithCancelWatchInterval.
 	defaultCancelWatchPollInterval = 5 * time.Second
@@ -451,7 +460,7 @@ const (
 
 // cancelWatchQueue is unbounded and duro-owned: watchers must never compete
 // with (or deadlock behind) user workloads on the batch's own queue.
-var cancelWatchQueue = NewQueue(cancelWatchQueueName)
+var cancelWatchQueue = NewQueue(CancelWatchQueueName)
 
 // cancelWatchInput is the watcher's durable input. Fields are exported for
 // serialization; the type itself stays internal.
@@ -482,7 +491,7 @@ func cancelWatcher(ctx dbos.DBOSContext, in cancelWatchInput) (string, error) {
 // must be recoverable on every executor, whether or not this process runs
 // cancel-enabled pipelines itself.
 func registerCancelWatcher(ctx Context) error {
-	dbos.RegisterWorkflow(ctx, cancelWatcher, dbos.WithWorkflowName(cancelWatcherName))
+	dbos.RegisterWorkflow(ctx, cancelWatcher, dbos.WithWorkflowName(CancelWatcherName))
 	return ensureQueue(ctx, cancelWatchQueue)
 }
 

@@ -54,7 +54,9 @@ without writing a single line of recovery code.
 - **Durable control flow** — `Branch`, `Switch`, and `Loop` make routing and
   polling checkpointed stages instead of hand-written workflow code, `Rescue`
   does the same for error handling (best-effort segments, report-then-rethrow),
-  and `Status`/`Attach` reconcile any persisted run ID from any process.
+  and `Status`/`Attach` reconcile any persisted run ID from any process —
+  with `ListRuns`/`Steps`/`Cancel`/`Resume` giving an admin tier the whole
+  fleet, from an enqueue-only `Client` too.
 
 ## Installation
 
@@ -493,6 +495,66 @@ ids...)` is the batch form; `duro.Attach[R](app, runID)` reconnects a
 restarted process to a live handle so it can await the result, not just
 poll. `Handle.Status()` returns the same `RunStatus`.
 
+`ListRuns` is the fleet-wide view — every run of every registered pipeline,
+from any process attached to the system database — filtered, paged, and
+ordered by options; `Steps` inspects one run's checkpoints:
+
+```go
+runs, err := duro.ListRuns(app,
+	duro.WithNames("invoice", "refund"),
+	duro.WithStates(duro.StateError, duro.StateRetriesExceeded),
+	duro.WithCreatedAfter(time.Now().Add(-24*time.Hour)),
+	duro.WithNewestFirst(), duro.WithLimit(50), duro.WithOffset(page*50))
+
+steps, err := duro.Steps(app, runs[0].ID) // []StepStatus: ID, Name, Err, ChildID, StartedAt, CompletedAt
+```
+
+`RunStatus` carries the cheap per-run columns an admin view needs —
+`QueueName`, `ParentID` (set on FanOut children, so top-level runs are the ones
+without one), `Attempts`, `StartedAt`, `ExecutorID` — plus `Input`, the stored
+input as JSON text, loaded only when `WithInput()` asks for it. Everything else
+stays payload-free, and a failed run's `Err` is filled exactly as `Status` fills
+it. The options refuse to surprise: a membership filter given no values
+(`WithIDs()`) matches nothing rather than everything, and a non-positive
+`WithLimit` is an error rather than an empty page. `Steps` returns what the run
+has checkpointed — the shape checkpoint (`duro.ShapeStepName`) first, then one
+entry per durable stage execution — which is exactly what replays on recovery.
+duro's own durable plumbing is listed too: every cancel-enabled `FanOut` batch
+runs a watcher workflow named `duro.CancelWatcherName` on the
+`duro.CancelWatchQueueName` queue, so an admin view can show — or filter out —
+those rows by name, and a watcher stuck non-terminal is visible rather than
+hidden.
+
+### Cancelling and resuming
+
+`Cancel` stops a live run at its next stage boundary (the stage in flight
+completes and is checkpointed); `Resume` revives a run under the same ID,
+replaying its checkpoints and continuing from the first stage that never
+finished:
+
+```go
+err := duro.Cancel(app, runID)          // errors.Is(err, duro.ErrRunTerminal) when already finished
+err := app.Resume(ctx, runID)           // bounded by ctx's deadline (or DefaultReadTimeout)
+err := duro.ForkFromStage[R](app, ...)  // the re-run for everything Resume refuses
+```
+
+`Resume` takes exactly the runs no executor can still be executing: one that
+exceeded its recovery attempts, or one cancelled before it ever started. A run
+cancelled *after* it started is refused with `ErrRunInFlight` — cancellation
+lands at the next stage boundary, so the stage in flight keeps running on its
+executor, and nothing DBOS records says when it stops; resuming under the same
+ID could execute it twice. Re-run such a run with `ForkFromStage`: a new ID,
+the old run stays cancelled. Success and error runs are finished and return
+`ErrRunTerminal` (fork those too); pending, enqueued, and delayed runs return
+`ErrRunActive` — cancel first. Nothing silently no-ops. The state check is
+part of the transition itself: `Resume` is one guarded `UPDATE` of duro's own
+(which is why it is a method on `App` rather than a function of a context),
+so two concurrent resumes, or a resume racing a worker that already picked the
+run up, cannot both apply. A resumed run that still records its queue goes
+back on it; DBOS clears the queue when it cancels or dead-letters a run, so in
+practice a resumed run executes on DBOS's internal queue, outside its original
+queue's limits.
+
 ### Forking from a stage
 
 `ForkFromStage` restarts an existing run from a named stage: earlier stages
@@ -577,7 +639,36 @@ defer c.Shutdown(5 * time.Second)
 
 handle, err := duro.Enqueue(c, Jobs, InvoiceJob, batch)
 status, err := c.Status(handle.ID()) // duro.RunStatus, the same States as duro.Status
+runs, err := c.ListRuns(duro.WithStates(duro.StateRetriesExceeded)) // the admin view, same options as duro.ListRuns
 ```
+
+A `Client` carries the whole read and remediation surface — `Status`,
+`StatusAll`, `ListRuns`, `Steps`, `Cancel`, `Resume` — as thin calls into the
+same core the engine's functions use, so an admin site built on a `Client`
+sees exactly what the workers see and can never disagree with them about a
+run's state.
+
+Those reads are bounded. DBOS retries a failed database read indefinitely
+until its context ends, which in a request handler means an outage parks a
+goroutine per call until the database returns; a `Client` instead runs every
+read on its own bounded context — `ClientConfig.ReadTimeout`, 30s by default
+— and `WithContext` adds the request's own deadline on top:
+
+```go
+c, err := duro.NewClient(ctx, duro.ClientConfig{DatabaseURL: url, ReadTimeout: 10 * time.Second})
+
+func list(w http.ResponseWriter, r *http.Request) {
+	runs, err := c.WithContext(r.Context()).ListRuns(duro.WithNewestFirst(), duro.WithLimit(50))
+	// ...
+}
+```
+
+The bound covers a whole call, however many queries it issues, and the error
+says what ended it: a deadline — `ReadTimeout` or the request's — wraps
+`context.DeadlineExceeded`, a cancelled request wraps `context.Canceled`.
+`Enqueue` and `Handle` waits are not covered — `dbos.Client` offers no context
+for them. On the engine, derive a bounded context with
+`dbos.WithTimeout(app.Context(), d)` and pass it to `duro.ListRuns` and friends.
 
 A `Job` is the pipeline's cross-process identity: its registered name and both
 of its types in one declaration, shared by the process that registers it and
@@ -687,9 +778,11 @@ whole feature set:
   contract and the stranded-run warning.
 - [`examples/fleet`](examples/fleet) — **worker-pool mode**: a two-process app —
   a `duro.New`+`WithWorkerPool` worker fleet and a `duro.NewClient` web tier that
-  enqueues without an engine — plus a `-crash` flag that kills a worker mid-run so
-  you can watch a survivor's sweeper take the run over and finish it, replaying the
-  checkpointed steps and re-running only the in-flight one.
+  enqueues without an engine, and a `-role=admin` view on the same `Client` that
+  lists the fleet's runs, dumps a run's checkpoints, and cancels or resumes one —
+  plus a `-crash` flag that kills a worker mid-run so you can watch a survivor's
+  sweeper take the run over and finish it, replaying the checkpointed steps and
+  re-running only the in-flight one.
 - [`examples/orders`](examples/orders) — **the fundamentals**: the same order
   workflow written both as plain sequential DBOS steps and as a duro pipeline
   (their recorded checkpoints are identical), plus a crash-recovery demo:

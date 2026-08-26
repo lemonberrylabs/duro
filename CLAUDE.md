@@ -8,10 +8,12 @@ Every stage executes inside `dbos.RunAsStep` and checkpoints to Postgres; a
 crashed process resumes mid-pipeline, replaying completed stages from their
 checkpoints instead of re-running them. [samber/ro](https://github.com/samber/ro)
 is the reactive engine underneath; DBOS provides the durability. Both deps are
-pre-1.0 and pinned — keep dependencies to those two, plus `jackc/pgx/v5` used
-**only** by worker-pool mode (`workerpool.go`/`client.go`), which needs a
-Postgres driver DBOS does not expose (pgx is already a transitive DBOS dep, so no
-new module enters the graph). Do not add a fourth. Test-only deps OK.
+pre-1.0 and pinned — keep dependencies to those two, plus `jackc/pgx/v5`,
+used **only** where duro runs its own SQL or owns a pool: worker-pool mode
+(`workerpool.go`), the `Client`'s pool (`client.go`), and the `App`'s admin pool
+for `Resume` (`app.go`) — a Postgres handle DBOS does not expose (pgx is already
+a transitive DBOS dep, so no new module enters the graph). Do not add a fourth.
+Test-only deps OK.
 
 ## Design philosophy (non-negotiable)
 
@@ -82,12 +84,26 @@ Single flat package at the repo root:
 - `register.go` — `Register`/`RegisterScheduled`/`RegisterDebounced`/
   `RegisterWorkflow`/`RegisterQueues`
 - `handle.go`, `status.go`, `fork.go` — `Handle`, `Status`/`StatusAll`/`Attach`,
-  `ForkFromStage`; `status.go` holds the shared `statusAll` mapping core
+  `ForkFromStage`; `status.go` holds `runStore` (the DBOS operations the
+  read/remediation APIs need, adapted from either an engine context or a
+  `dbos.Client`) and the shared `listRuns`/`statusAll` mapping cores
+- `list.go` — `ListRuns` + `ListOption`s (`WithNames`/`WithStates`/`WithIDs`/
+  `WithCreatedAfter`/`WithCreatedBefore`/`WithQueue`/`WithLimit`/`WithOffset`/
+  `WithNewestFirst`/`WithInput`), `Steps`/`StepStatus`
+- `control.go` — `Cancel`, `App.Resume`, `ErrRunTerminal`/`ErrRunActive`/
+  `ErrRunInFlight`; `Resume` is duro-owned SQL (`resumeSQL`, executed through
+  an `execFunc` the App and Client build from their pools with `poolExec`),
+  bounded by `boundContext` (client.go) like every Client read
 - `workerpool.go` — worker-pool mode: `WithWorkerPool` (+ cadence options),
   `WithRetention`, `WithStaleRunWarning`; the heartbeat lease, sweeper +
   liveness takeover, retention, all on a dedicated pgx pool
-- `client.go` — enqueue-only `Client`: `NewClient`, generic `Enqueue`,
-  `Status`/`StatusAll` (reusing `status.go`'s mapping)
+- `client.go` — enqueue-only `Client`: `NewClient`, generic `Enqueue`, and the
+  full read/remediation surface (`Status`/`StatusAll`/`ListRuns`/`Steps`/
+  `Cancel`/`Resume`) as thin calls into the same `runStore` cores the engine
+  uses. Enqueue goes through `dbos.Client`; every read runs on a duro-owned,
+  never-launched DBOS context (`reads`) derived per call with `readContext`,
+  bounded by `ClientConfig.ReadTimeout` and, on a `WithContext` view, the
+  caller's context
 
 ## Gotchas
 
@@ -150,6 +166,49 @@ Single flat package at the repo root:
   a **tombstoned** one (epoch timestamp) means "known-dead, adopt now". Lease
   pruning therefore must skip executors that still own non-terminal runs, or
   those runs become permanently unadoptable.
+- Every run read or remediation — engine function and `Client` method alike —
+  must be a thin call into the shared `runStore` core (`status.go`), never a
+  parallel implementation: an api tier on a `Client` and the workers must agree
+  on every State, on "terminal", and on which runs `Resume` accepts. `Resume`
+  deliberately refuses live runs (`ErrRunActive` — DBOS's resume re-enqueues a
+  PENDING run while its executor may still be running it, the double-execution
+  yank) and success/error runs (`ErrRunTerminal` — DBOS silently no-ops those);
+  `Cancel` refuses terminal runs for the same reason. An empty membership
+  filter (`WithIDs()`) matches nothing, never everything.
+- **`Resume`'s state guard is the `UPDATE`'s own `WHERE`** (`resumeSQL`:
+  `status = MAX_RECOVERY_ATTEMPTS_EXCEEDED OR (status = CANCELLED AND
+  recovery_attempts = 0)`), never a check-then-act on `dbos.ResumeWorkflow`:
+  DBOS's guard admits PENDING, so two callers that both saw "cancelled" would
+  have the second re-enqueue a run the first one's worker is already
+  executing. The `recovery_attempts = 0` half is the quiescence rule:
+  CANCELLED does **not** mean the executor stopped — cancellation lands at the
+  next step start, the in-flight stage runs to completion, and nothing in the
+  schema records the goroutine's exit — so a run cancelled after any start is
+  refused forever (`ErrRunInFlight`; the remedy is `ForkFromStage`). Do not
+  "fix" that by waiting or guessing. Like takeover it is coupled to DBOS's
+  schema; unlike takeover it resets `recovery_attempts` on purpose (an
+  operator's explicit action grants a fresh budget, as DBOS's resume does) and
+  keeps the run's queue via `COALESCE(NULLIF(queue_name, ''), internal)`.
+  Pinned by `TestResumeTransitionGuard` and
+  `TestResumeRefusesRunCancelledMidExecution`.
+- **Never rely on DBOS's `loadInput`/`loadOutput` defaults.** They are
+  "on once `Launch()` ran" — true on an engine, never on a `dbos.Client`
+  (`NewClient` never launches). A query that omits `WithLoadOutput(true)`
+  reads the recorded error on the workers and the placeholder
+  `duro: run error` in an api tier, and nothing local reproduces it because
+  dev runs the engine. Pass both flags explicitly on every `ListWorkflows`
+  call; pinned by `TestClientFailedRunExposesError`.
+- **Client reads must go through `readContext`, once per public call**, never
+  `c.c.ListWorkflows` and friends on the `dbos.Client`: that interface exposes
+  no context, and DBOS retries every failed read forever (`maxRetries: -1`,
+  backoff to 30s) until its context ends — a read on it hangs an api-tier
+  goroutine for the length of a database outage. One context per call, not
+  per query, or a two-query call takes two timeouts. `readContext` takes the
+  sooner of `ReadTimeout` and the caller's deadline and only propagates the
+  caller's *cancellation*, so a deadline surfaces as `DeadlineExceeded`, not
+  `Canceled`. `Enqueue` and `Handle` waits still hang; documented, not fixable
+  from duro. Pinned by `TestClientReadTimeoutBoundsBlockedRead` and
+  `TestClientWithContextDeadlineIsDeadline`.
 - `go build` in `examples/` drops binaries (e.g. `housekeeping`, `fleet`) —
   don't commit them.
 - Open an issue before behavior changes or new primitives (per CONTRIBUTING.md).

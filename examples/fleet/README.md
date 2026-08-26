@@ -8,6 +8,7 @@ web tier that starts work without running an engine.
 createdb duro_fleet
 go run . -role=worker          # a worker  (or: DBOS_SYSTEM_DATABASE_URL=... go run .)
 go run . -role=web             # the enqueue-only web tier
+go run . -role=admin           # the admin view: list runs, inspect checkpoints
 ```
 
 Each process prints its lines prefixed with the executor that produced them, so
@@ -23,6 +24,10 @@ across terminals you can watch work move between workers.
 | Auto executor ID | each worker gets a unique identity — no `ExecutorID` is set |
 | `NewClient` + `Enqueue` | `-role=web` starts a run with no engine and polls `Client.Status` |
 | `NewJob` + `RegisterJob` | `resizeJob` declares the name and both types once; the workers register it and the web tier enqueues it |
+| `Client.ListRuns` + `Client.Steps` | `-role=admin` lists the fleet's newest runs (state, attempts, queue, executor, input) and dumps the newest run's checkpoints |
+| `ClientConfig.ReadTimeout` | the admin client bounds every read at 10s, so a database outage fails the command instead of hanging it |
+| `Client.Cancel` / `Client.Resume` | `-role=admin -cancel ID` stops a live run at its next stage; `-resume ID` revives a run no executor can still be running (retries-exceeded, or cancelled before it started) under the same ID |
+| `ErrRunInFlight` | `-resume` on a run cancelled mid-stage is refused: the stage may still be running, and only `ForkFromStage` (on a worker) re-runs it safely |
 | `WithStaleRunWarning` | workers warn about non-terminal runs older than 15s |
 | Queue-preserving takeover | `resize-jobs` is capped at `WithConcurrency(2)`; an adopted run returns to it, so a crash cannot exceed the cap |
 
@@ -54,6 +59,60 @@ go run . -role=web       # terminal 2: enqueue one job, poll until done
 The web tier imports no engine and launches no queue runners; it shares only the
 database. Its `duro.Status` view of the run is the exact same `RunStatus` the
 workers see.
+
+## The admin view
+
+The admin role is the same enqueue-only `Client`, used for reads: it registers
+no pipeline, launches no engine, and still sees every run in the system through
+the same status mapping as the workers.
+
+```bash
+go run . -role=worker            # terminal 1: a worker to run jobs
+go run . -role=web               # terminal 2: enqueue a job (takes ~12s)
+go run . -role=admin             # terminal 3: while it runs — and again after
+```
+
+The listing shows each run's state, attempt count, queue, executor, and (because
+the example asks with `WithInput()`) its input as JSON; below it, the newest
+run's checkpoints — `duro.shape` first, then one line per completed stage with
+start and finish times. Run it mid-job and only `decode` is there; run it after
+and `resize` and `encode` have joined it. Those checkpoints are exactly what a
+takeover or a resume replays.
+
+Remediation uses the same client. Start a job and cancel it while `resize` is
+still counting:
+
+```bash
+go run . -role=admin -cancel <run-id>    # the in-flight stage finishes, the run stops at `encode`
+go run . -role=admin -resume <run-id>    # refused: ErrRunInFlight
+```
+
+Watch the worker: after the cancel it logs the rest of `resize N/10` — a stage
+in flight completes and checkpoints; cancellation lands at the next stage
+boundary — and nothing more. The resume is refused, and that is the point: the
+database says `cancelled`, but not whether the worker is still inside `resize`
+(it is, for up to ten seconds, and nothing DBOS records says when it leaves).
+Resuming under the same ID could run the stage twice, so `Resume` never does
+it, not even after the worker has visibly moved on. The safe re-run is
+`duro.ForkFromStage` on a worker: a new run that copies the checkpoints and
+finishes, while this one stays cancelled.
+
+`Resume` is for runs no executor can be running. Cancel one before it ever
+starts — no worker up, so the job waits on its queue — then resume it and
+start a worker:
+
+```bash
+go run . -role=web                       # terminal 1, no worker running: enqueued, waiting
+go run . -role=admin -cancel <run-id>    # cancelled before any start
+go run . -role=admin -resume <run-id>    # back to enqueued under the same ID
+go run . -role=worker                    # terminal 2: picks it up and runs it; terminal 1 sees success
+```
+
+The same path revives a run that exceeded its recovery attempts. Nothing
+no-ops silently: cancelling a finished run or resuming a successful one prints
+a refusal with `duro.ErrRunTerminal`, resuming a live run prints one with
+`duro.ErrRunActive` (cancel it first), and resuming a run cancelled mid-stage
+prints `duro.ErrRunInFlight`.
 
 ## Crash takeover
 

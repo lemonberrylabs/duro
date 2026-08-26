@@ -54,3 +54,70 @@ func TestRunStatusSynthesizesFailureError(t *testing.T) {
 		t.Errorf("success Err = %v, want nil", ok.Err)
 	}
 }
+
+// TestStateRoundTrip pins the State→DBOS mapping ListRuns filters with as the
+// exact inverse of the DBOS→State mapping statuses are reported with, so a
+// filter on a State always matches the runs reported in that State — unknown
+// values included, which pass through both ways.
+func TestStateRoundTrip(t *testing.T) {
+	for _, s := range []State{StatePending, StateEnqueued, StateDelayed, StateSuccess, StateError, StateCancelled, StateRetriesExceeded, State("SOMETHING_NEW")} {
+		if got := stateOf(dbosStatusOf(s)); got != s {
+			t.Errorf("stateOf(dbosStatusOf(%s)) = %s", s, got)
+		}
+	}
+	for _, d := range []dbos.WorkflowStatusType{dbos.WorkflowStatusPending, dbos.WorkflowStatusEnqueued, dbos.WorkflowStatusDelayed,
+		dbos.WorkflowStatusSuccess, dbos.WorkflowStatusError, dbos.WorkflowStatusCancelled, dbos.WorkflowStatusMaxRecoveryAttemptsExceeded} {
+		if got := dbosStatusOf(stateOf(d)); got != d {
+			t.Errorf("dbosStatusOf(stateOf(%s)) = %s", d, got)
+		}
+	}
+	if dbosStatusOf(StateRetriesExceeded) != dbos.WorkflowStatusMaxRecoveryAttemptsExceeded {
+		t.Error("retries_exceeded must filter as MAX_RECOVERY_ATTEMPTS_EXCEEDED")
+	}
+}
+
+// TestInputJSON pins how a loaded input becomes RunStatus.Input: DBOS's
+// decoded JSON text passes through verbatim, nil stays nil, and anything else
+// is marshalled.
+func TestInputJSON(t *testing.T) {
+	cases := []struct {
+		in   any
+		want string
+	}{
+		{nil, ""},
+		{"42", "42"},
+		{`{"a":[1,2]}`, `{"a":[1,2]}`},
+		{[]byte(`"text"`), `"text"`},
+		{"not json", `"not json"`},
+		{struct{ N int }{3}, `{"N":3}`},
+	}
+	for _, c := range cases {
+		got, err := inputJSON(c.in)
+		if err != nil {
+			t.Errorf("inputJSON(%v): %v", c.in, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("inputJSON(%v) = %s, want %s", c.in, got, c.want)
+		}
+	}
+	if _, err := inputJSON(make(chan int)); err == nil {
+		t.Error("inputJSON(unmarshallable) = nil error, want one")
+	}
+}
+
+// TestListRunsShortCircuits proves an empty membership filter and an invalid
+// option are resolved before any query is issued.
+func TestListRunsShortCircuits(t *testing.T) {
+	store := runStore{list: func(...dbos.ListWorkflowsOption) ([]dbos.WorkflowStatus, error) {
+		t.Fatal("ListRuns queried the store")
+		return nil, nil
+	}}
+	runs, err := listRunsWith(store, []ListOption{WithNames("a"), WithIDs()})
+	if err != nil || runs == nil || len(runs) != 0 {
+		t.Errorf("empty filter: runs=%v err=%v, want an empty non-nil list", runs, err)
+	}
+	if _, err := listRunsWith(store, []ListOption{WithLimit(-5), WithLimit(-6)}); err == nil || err.Error() != "duro: ListRuns: WithLimit(-5): limit must be positive" {
+		t.Errorf("invalid limit error = %v, want the first invalid option reported", err)
+	}
+}

@@ -3,11 +3,14 @@ package duro
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/dbos-inc/dbos-transact-golang/dbos"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Config configures a duro application.
@@ -59,6 +62,14 @@ type App struct {
 	// wp holds the worker-pool liveness machinery; nil unless WithWorkerPool
 	// (or WithRetention / WithStaleRunWarning) is passed to New.
 	wp *workerPool
+
+	// databaseURL and admin back Resume's guarded transition, which is
+	// duro's own SQL and needs a connection DBOS does not expose. The pool is
+	// opened on first use, and only when there is no worker-pool pool to share.
+	databaseURL string
+	adminOnce   sync.Once
+	admin       *pgxpool.Pool
+	adminErr    error
 }
 
 // New initializes the application. Register pipelines and queues after New
@@ -109,7 +120,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*App, error) {
 		dctx.Shutdown(5 * time.Second)
 		return nil, err
 	}
-	app := &App{DBOSContext: dctx, logger: logger}
+	app := &App{DBOSContext: dctx, logger: logger, databaseURL: cfg.DatabaseURL}
 	// The worker-pool machinery (dedicated pool, heartbeat table) is also what
 	// retention and stale-run warning run on, so open it for any of the three.
 	if o.workerPool || o.retention > 0 || o.staleRunWarn > 0 {
@@ -126,6 +137,38 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*App, error) {
 // Context returns the underlying DBOS context — for calling raw dbos package
 // functions directly. Everything in duro accepts the App itself.
 func (a *App) Context() Context { return a.DBOSContext }
+
+// sqlExec returns the executor Resume's transition runs on: the worker-pool
+// pool when there is one, otherwise a small pool opened on first use.
+func (a *App) sqlExec() (execFunc, error) {
+	if a.wp != nil {
+		return poolExec(a.wp.pool), nil
+	}
+	a.adminOnce.Do(func() {
+		pcfg, err := pgxpool.ParseConfig(a.databaseURL)
+		if err != nil {
+			a.adminErr = fmt.Errorf("duro: parsing database URL: %w", err)
+			return
+		}
+		pcfg.MaxConns = 2 // one statement at a time, on an operator's cadence
+		a.admin, a.adminErr = pgxpool.NewWithConfig(context.Background(), pcfg)
+	})
+	if a.adminErr != nil {
+		return nil, a.adminErr
+	}
+	return poolExec(a.admin), nil
+}
+
+// poolExec adapts a pgx pool to the execFunc the run-control cores take.
+func poolExec(pool *pgxpool.Pool) execFunc {
+	return func(ctx context.Context, sql string, args ...any) (int64, error) {
+		tag, err := pool.Exec(ctx, sql, args...)
+		if err != nil {
+			return 0, err
+		}
+		return tag.RowsAffected(), nil
+	}
+}
 
 // Launch starts DBOS: workflow recovery, queue runners, and schedulers. Call
 // it after all registrations. It then warns about stranded runs — see App.
@@ -171,6 +214,11 @@ func (a *App) Shutdown(timeout time.Duration) {
 		a.wp.stopMaintenance()
 	}
 	dbos.Shutdown(a.DBOSContext, timeout)
+	// Refuse to open the admin pool from here on, and close it if it exists.
+	a.adminOnce.Do(func() { a.adminErr = errors.New("duro: app is shut down") })
+	if a.admin != nil {
+		a.admin.Close()
+	}
 	if a.wp != nil {
 		a.wp.closeOnce.Do(func() {
 			a.wp.stopBeat()

@@ -1,10 +1,12 @@
 // Command fleet demonstrates duro's worker-pool mode: a fleet of interchangeable
-// workers that recover each other's runs, and an enqueue-only web tier that
-// starts work without running an engine. See the README for the walkthrough.
+// workers that recover each other's runs, an enqueue-only web tier that starts
+// work without running an engine, and an admin view on that same client that
+// lists, inspects, cancels, and resumes runs. See the README for the walkthrough.
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -33,8 +35,10 @@ var resizeQueue = duro.NewQueue("resize-jobs", duro.WithConcurrency(2))
 var resizeJob = duro.NewJob[string, string]("resize")
 
 func main() {
-	role := flag.String("role", "worker", "worker | web")
+	role := flag.String("role", "worker", "worker | web | admin")
 	crash := flag.Bool("crash", false, "worker only: start a job then crash mid-run (simulates kill -9)")
+	cancelID := flag.String("cancel", "", "admin only: cancel the run with this ID before listing")
+	resumeID := flag.String("resume", "", "admin only: resume the run with this ID before listing (retries-exceeded, or cancelled before it started)")
 	flag.Parse()
 
 	switch *role {
@@ -42,8 +46,10 @@ func main() {
 		runWorker(*crash)
 	case "web":
 		runWeb()
+	case "admin":
+		runAdmin(*cancelID, *resumeID)
 	default:
-		fatal("unknown -role %q (want worker | web)", *role)
+		fatal("unknown -role %q (want worker | web | admin)", *role)
 	}
 }
 
@@ -124,6 +130,88 @@ func runWeb() {
 			return
 		}
 		time.Sleep(time.Second)
+	}
+}
+
+// runAdmin is the operator's view, built on the same enqueue-only client as the
+// web tier: remediate a run if asked, then list every resize run in the system
+// — whatever process ran it — and dump the newest one's checkpoints. Nothing
+// here needs the pipeline registered; the client reads through the same
+// mapping the workers use, so the states it prints are the workers' states.
+func runAdmin(cancelID, resumeID string) {
+	c, err := duro.NewClient(context.Background(), duro.ClientConfig{
+		DatabaseURL: databaseURL(),
+		Logger:      logger(),
+		// Every read below fails after 10s instead of hanging for as long as
+		// the database is unreachable (the default bound is 30s).
+		ReadTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		fatal("initializing client: %v", err)
+	}
+	defer c.Shutdown(5 * time.Second)
+
+	if cancelID != "" {
+		remediate("cancel", cancelID, c.Cancel(cancelID))
+	}
+	if resumeID != "" {
+		remediate("resume", resumeID, c.Resume(resumeID))
+	}
+
+	runs, err := c.ListRuns(
+		duro.WithNames(resizeJob.Name()),
+		duro.WithNewestFirst(),
+		duro.WithLimit(10),
+		duro.WithInput(), // off by default: the list stays payload-free unless asked
+	)
+	if err != nil {
+		fatal("listing runs: %v", err)
+	}
+	if len(runs) == 0 {
+		fmt.Println("[admin] no resize runs yet — start one with -role=web")
+		return
+	}
+	fmt.Printf("[admin] newest %d %s runs:\n", len(runs), resizeJob.Name())
+	for _, r := range runs {
+		fmt.Printf("[admin]   %s  %-16s attempts=%d queue=%-12q executor=%s input=%s\n",
+			r.ID, r.State, r.Attempts, r.QueueName, r.ExecutorID, r.Input)
+		if r.Err != nil {
+			fmt.Printf("[admin]     error: %v\n", r.Err)
+		}
+	}
+
+	latest := runs[0]
+	steps, err := c.Steps(latest.ID)
+	if err != nil {
+		fatal("listing steps: %v", err)
+	}
+	fmt.Printf("[admin] checkpoints of %s (%s):\n", latest.ID, latest.State)
+	for _, s := range steps {
+		fmt.Printf("[admin]   %d  %-12s %s → %s\n", s.ID, s.Name,
+			s.StartedAt.Format("15:04:05.000"), s.CompletedAt.Format("15:04:05.000"))
+		if s.Err != nil {
+			fmt.Printf("[admin]      error: %v\n", s.Err)
+		}
+	}
+}
+
+// remediate reports a Cancel/Resume outcome. The typed errors are the point:
+// neither call silently no-ops, so an admin button can say exactly why nothing
+// changed.
+func remediate(what, id string, err error) {
+	switch {
+	case err == nil:
+		fmt.Printf("[admin] %s %s: done\n", what, id)
+	case errors.Is(err, duro.ErrRunNotFound):
+		fatal("%s %s: no such run", what, id)
+	case errors.Is(err, duro.ErrRunTerminal):
+		fmt.Printf("[admin] %s %s: refused, run already finished (%v)\n", what, id, err)
+	case errors.Is(err, duro.ErrRunActive):
+		fmt.Printf("[admin] %s %s: refused, run is still live — cancel it first (%v)\n", what, id, err)
+	case errors.Is(err, duro.ErrRunInFlight):
+		fmt.Printf("[admin] %s %s: refused, the run was cancelled mid-stage and that stage may still be running — re-run it with ForkFromStage on a worker (%v)\n", what, id, err)
+	default:
+		fatal("%s %s: %v", what, id, err)
 	}
 }
 
