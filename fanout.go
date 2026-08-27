@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/dbos-inc/dbos-transact-golang/dbos"
@@ -114,7 +115,7 @@ func WithChildAuthenticatedUser(user string) ChildOption {
 // WithChildAuthenticatedRoles records the authenticated roles on every child
 // workflow's status.
 func WithChildAuthenticatedRoles(roles ...string) ChildOption {
-	return staticChild(dbos.WithAuthenticatedRoles(roles))
+	return staticChild(dbos.WithAuthenticatedRoles(roles...))
 }
 
 // WithChildAssumedRole records the assumed role on every child workflow's
@@ -176,7 +177,8 @@ func WithChildTimeout(d time.Duration) ChildOption {
 // Nor does cancellation depend on this process surviving the await:
 // alongside the batch, the stage enqueues duro's cancellation watcher — an
 // internal durable workflow (registered by New as CancelWatcherName on the
-// internal CancelWatchQueueName queue; both names are durable identities)
+// application-qualified queue returned by CancelWatchQueueNameFor; both names
+// are durable identities)
 // that watches the same children and cancels redundantly. Any executor can
 // dequeue or recover the watcher, so a failure is acted on even when the
 // parent's executor dies mid-await. The stage requires the watcher to be
@@ -232,7 +234,7 @@ func (r workflowFuncRef[T, R]) runOptions() []dbos.WorkflowOption { return nil }
 // resolveChildOpts validates the config against the stage's item type and
 // returns the per-item DBOS option builder. It panics on a type mismatch —
 // construction time, like every other stage validation.
-func resolveChildOpts[T, R any](cfg childConfig, name string, queue Queue, ref WorkflowRef[T, R]) func(in T) []dbos.WorkflowOption {
+func resolveChildOpts[T, R any](cfg childConfig, name string, ref WorkflowRef[T, R]) func(in T, queue dbos.Queue) []dbos.WorkflowOption {
 	perItem := make([]func(T) dbos.WorkflowOption, len(cfg.perItem))
 	for i, raw := range cfg.perItem {
 		fn, ok := raw.(func(in T) dbos.WorkflowOption)
@@ -241,10 +243,11 @@ func resolveChildOpts[T, R any](cfg childConfig, name string, queue Queue, ref W
 		}
 		perItem[i] = fn
 	}
-	fixed := append([]dbos.WorkflowOption{dbos.WithQueue(queue.name)}, ref.runOptions()...)
+	fixed := append([]dbos.WorkflowOption{}, ref.runOptions()...)
 	fixed = append(fixed, cfg.static...)
-	return func(in T) []dbos.WorkflowOption {
-		opts := make([]dbos.WorkflowOption, 0, len(fixed)+len(perItem))
+	return func(in T, queue dbos.Queue) []dbos.WorkflowOption {
+		opts := make([]dbos.WorkflowOption, 0, len(fixed)+len(perItem)+1)
+		opts = append(opts, dbos.WithQueue(queue))
 		opts = append(opts, fixed...)
 		for _, fn := range perItem {
 			opts = append(opts, fn(in))
@@ -305,7 +308,7 @@ func FanOut[T, R any](name string, queue Queue, wf WorkflowRef[T, R], opts ...Ch
 			panic(fmt.Sprintf("duro: FanOut stage %q: WithCancelWatchInterval requires a positive duration", name))
 		}
 	}
-	childOpts := resolveChildOpts(cfg, name, queue, wf)
+	childOpts := resolveChildOpts(cfg, name, wf)
 	childWf := wf.dbosWorkflow()
 
 	// The two modes checkpoint differently (per-child getResult steps vs one
@@ -337,6 +340,12 @@ func FanOut[T, R any](name string, queue Queue, wf WorkflowRef[T, R], opts ...Ch
 						fail(ctx, err)
 						return
 					}
+					queueHandle, err := queue.handle(state.dctx)
+					if err != nil {
+						state.aborted.Store(true)
+						fail(ctx, err)
+						return
+					}
 					runCtx := state.dctx
 					if cfg.timeout > 0 {
 						// The deadline travels into the child's durable status
@@ -346,7 +355,7 @@ func FanOut[T, R any](name string, queue Queue, wf WorkflowRef[T, R], opts ...Ch
 						runCtx, cancel = dbos.WithTimeout(runCtx, cfg.timeout)
 						cancels = append(cancels, cancel)
 					}
-					handle, err := dbos.RunWorkflow(runCtx, childWf, in, childOpts(in)...)
+					handle, err := dbos.RunWorkflow(runCtx, childWf, in, childOpts(in, queueHandle)...)
 					if err != nil {
 						state.aborted.Store(true)
 						fail(ctx, fmt.Errorf("duro: stage %q: enqueueing child workflow: %w", name, err))
@@ -382,7 +391,13 @@ func FanOut[T, R any](name string, queue Queue, wf WorkflowRef[T, R], opts ...Ch
 							interval = defaultCancelWatchPollInterval
 						}
 						watch := cancelWatchInput{Stage: name, WorkflowIDs: uniqueWorkflowIDs(ids), PollInterval: interval}
-						if _, err := dbos.RunWorkflow(state.dctx, cancelWatcher, watch, dbos.WithQueue(CancelWatchQueueName)); err != nil {
+						watchQueue, err := cancelWatchQueueFor(state.dctx)
+						if err != nil {
+							state.aborted.Store(true)
+							fail(ctx, err)
+							return
+						}
+						if _, err := dbos.RunWorkflow(state.dctx, cancelWatcher, watch, dbos.WithQueue(watchQueue)); err != nil {
 							state.aborted.Store(true)
 							fail(ctx, fmt.Errorf("duro: stage %q: enqueueing the cancellation watcher (built the app with duro.New, which registers it?): %w", name, err))
 							return
@@ -449,18 +464,31 @@ const (
 	// A watcher stuck non-terminal is worth an operator's attention. The name
 	// is a durable identity: it never changes.
 	CancelWatcherName = "duro.cancel-watcher"
-	// CancelWatchQueueName is the duro-owned queue watcher runs execute on
-	// (WithQueue(CancelWatchQueueName) lists them by queue). Also a durable
-	// identity.
+	// CancelWatchQueueName is the legacy v0 queue and the prefix for v1's
+	// application-qualified watcher queues. See CancelWatchQueueNameFor.
 	CancelWatchQueueName = "duro.cancel-watch"
 	// The backstop cadence; the parent's await polls faster, and a stage can
 	// tune this with WithCancelWatchInterval.
 	defaultCancelWatchPollInterval = 5 * time.Second
 )
 
-// cancelWatchQueue is unbounded and duro-owned: watchers must never compete
-// with (or deadlock behind) user workloads on the batch's own queue.
-var cancelWatchQueue = NewQueue(CancelWatchQueueName)
+var cancelWatchQueues sync.Map // *applicationRuntime -> Queue
+
+// CancelWatchQueueNameFor returns the durable queue name used by new watcher
+// runs for an application. The legacy unsuffixed queue is also registered when
+// available so v0 watcher runs can drain during an upgrade.
+func CancelWatchQueueNameFor(applicationName string) string {
+	return CancelWatchQueueName + "." + applicationName
+}
+
+func cancelWatchQueueFor(ctx Context) (dbos.Queue, error) {
+	runtime := applicationRuntimeFromContext(ctx)
+	value, ok := cancelWatchQueues.Load(runtime)
+	if !ok {
+		return nil, fmt.Errorf("duro: cancellation watcher queue is not registered for application %q", applicationNameFromContext(ctx))
+	}
+	return value.(Queue).handle(ctx)
+}
 
 // cancelWatchInput is the watcher's durable input. Fields are exported for
 // serialization; the type itself stays internal.
@@ -474,7 +502,7 @@ type cancelWatchInput struct {
 // through a detached context, so the loop records no steps: a recovered
 // watcher simply starts over, which is exactly the idempotent behavior
 // cancellation needs.
-func cancelWatcher(ctx dbos.DBOSContext, in cancelWatchInput) (string, error) {
+func cancelWatcher(ctx dbos.Context, in cancelWatchInput) (string, error) {
 	interval := in.PollInterval
 	if interval <= 0 {
 		interval = defaultCancelWatchPollInterval
@@ -490,9 +518,23 @@ func cancelWatcher(ctx dbos.DBOSContext, in cancelWatchInput) (string, error) {
 // context. Called by duro.New, before Launch, on every app — cancellation
 // must be recoverable on every executor, whether or not this process runs
 // cancel-enabled pipelines itself.
-func registerCancelWatcher(ctx Context) error {
+func registerCancelWatcher(ctx Context, appName string) error {
 	dbos.RegisterWorkflow(ctx, cancelWatcher, dbos.WithWorkflowName(CancelWatcherName))
-	return ensureQueue(ctx, cancelWatchQueue)
+	// Claim the legacy v0 queue when possible so pending watcher runs can drain.
+	// A conflict only means another application sharing this database owns it.
+	legacy := NewQueue(CancelWatchQueueName)
+	if err := ensureQueue(ctx, legacy); err != nil {
+		var dbosErr *dbos.Error
+		if !errors.As(err, &dbosErr) || dbosErr.Code != dbos.ErrorCodeConflictingRegistration {
+			return err
+		}
+	}
+	queue := NewQueue(CancelWatchQueueNameFor(appName))
+	if err := ensureQueue(ctx, queue); err != nil {
+		return err
+	}
+	cancelWatchQueues.Store(applicationRuntimeFromContext(ctx), queue)
+	return nil
 }
 
 // awaitCancellingSiblings is the awaiting phase of a cancel-enabled FanOut,
@@ -513,7 +555,7 @@ func registerCancelWatcher(ctx Context) error {
 // context (the workflow's context re-rooted on a plain background context):
 // the same system database, but outside the workflow, so none of it is
 // checkpointed as workflow steps.
-func awaitCancellingSiblings[R any](dctx dbos.DBOSContext, name string, ids []string) ([]R, error) {
+func awaitCancellingSiblings[R any](dctx dbos.Context, name string, ids []string) ([]R, error) {
 	return dbos.RunAsStep(dctx, func(context.Context) ([]R, error) {
 		detached := dbos.From(dctx, context.Background())
 		if err := watchAndCancel(dctx, detached, name, ids, fanOutCancelPollInterval); err != nil {
@@ -576,16 +618,16 @@ func uniqueWorkflowIDs(ids []string) []string {
 // replacing the children's outcome with an infrastructure error. Both the
 // parent's await step and the cancellation watcher run this loop; whichever
 // observes the failure first cancels.
-func watchAndCancel(ctx context.Context, detached dbos.DBOSContext, name string, ids []string, pollInterval time.Duration) error {
+func watchAndCancel(ctx context.Context, detached dbos.Context, name string, ids []string, pollInterval time.Duration) error {
 	unique := uniqueWorkflowIDs(ids)
 
 	cancelIssued := false
 	for {
 		statuses, err := dbos.ListWorkflows(detached,
-			dbos.WithWorkflowIDs(unique),
-			dbos.WithLimit(len(unique)),
-			dbos.WithLoadInput(false),
-			dbos.WithLoadOutput(false),
+			dbos.WithFilterWorkflowIDs(unique...),
+			dbos.WithFilterLimit(len(unique)),
+			dbos.WithFilterLoadInput(false),
+			dbos.WithFilterLoadOutput(false),
 		)
 		if err != nil {
 			return fmt.Errorf("duro: stage %q: watching child workflows: %w", name, err)
@@ -627,6 +669,5 @@ func watchAndCancel(ctx context.Context, detached dbos.DBOSContext, name string,
 // isAwaitedCancellation reports whether a child result error means the child
 // was cancelled rather than failed.
 func isAwaitedCancellation(err error) bool {
-	var dbosErr *dbos.DBOSError
-	return errors.As(err, &dbosErr) && dbosErr.Code == dbos.AwaitedWorkflowCancelled
+	return errors.Is(err, dbos.ErrAwaitedWorkflowCancelled)
 }

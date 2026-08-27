@@ -28,7 +28,7 @@ and its old runs can never recover. duro turns that silent failure into a
 launch-time warning — walk it end to end:
 
 ```bash
-go run . -stranded=start     # 1. park a run in Recv, then exit like a crash
+go run . -stranded=start     # 1. park a run in Recv, then close the app
 go run . -stranded=renamed   # 2. register the pipeline as "welcome-v2" instead
 go run . -stranded=reattach  # 3. register "welcome" again and signal the run
 ```
@@ -48,12 +48,11 @@ Phase 3 re-registers the original name: recovery re-attaches the parked run,
 
 Two details worth internalizing:
 
-- **Phase 1 exits with `os.Exit`, deliberately.** A graceful `app.Shutdown`
-  drains in-flight work by cancelling it — a parked `Recv` would return the
-  cancellation as its error and the run would record ERROR, not stay PENDING.
-  Crashes leave runs recoverable; graceful shutdown *finishes* them. Keep
-  runs you want to survive restarts signal-driven, and let recovery — not the
-  drain — pick them up.
+- **Phase 1 closes gracefully.** Since DBOS v1.1, `app.Close` cancels local
+  execution so it can unwind but does not durably cancel the workflow. The
+  parked `Recv` remains PENDING and is recoverable on the next launch. Use
+  `duro.Cancel` when the durable intent is cancellation; process shutdown now
+  means interruption and recovery.
 - **The warning is advisory.** Launch does not fail; the stranded runs stay
   in the database untouched. Re-registering the old name (phase 3) or
   `dbos.ForkWorkflow` onto current code are both recovery paths.

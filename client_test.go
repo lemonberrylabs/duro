@@ -66,8 +66,9 @@ func launchR3Worker(t *testing.T, name, version string) *duro.App {
 func newR3Client(t *testing.T) *duro.Client {
 	t.Helper()
 	c, err := duro.NewClient(context.Background(), duro.ClientConfig{
-		DatabaseURL: testDatabaseURL(),
-		Logger:      quietLogger(),
+		DatabaseURL:     testDatabaseURL(),
+		ApplicationName: "duro-r3-worker",
+		Logger:          quietLogger(),
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -82,7 +83,7 @@ func newR3Client(t *testing.T) *duro.Client {
 // test's worker runs it.
 func TestClientEnqueueAndStatus(t *testing.T) {
 	worker := launchR3Worker(t, "duro-r3-worker", "r3-exec-v1")
-	defer worker.Shutdown(5 * time.Second)
+	defer worker.Close(5 * time.Second)
 	client := newR3Client(t)
 
 	h, err := duro.Enqueue(client, r3Queue, r3Echo, 42,
@@ -115,12 +116,14 @@ func TestClientEnqueueAndStatus(t *testing.T) {
 	if cs.ID != es.ID || cs.Name != es.Name {
 		t.Errorf("status fields diverge: client=%+v engine=%+v", cs, es)
 	}
+	if cs.ApplicationName != "duro-r3-worker" || es.ApplicationName != cs.ApplicationName {
+		t.Errorf("application ownership: client=%q engine=%q, want duro-r3-worker", cs.ApplicationName, es.ApplicationName)
+	}
 }
 
 // TestClientEnqueueDefaultVersionIsNull proves the request's default: with no
-// version option the enqueued run carries a NULL application version, so any
-// worker version may run it (rather than dbos's default of the client's own
-// version, which no worker would share).
+// version option the enqueued run carries a NULL application version, so DBOS
+// routes it to the owning application's latest registered version.
 func TestClientEnqueueDefaultVersionIsNull(t *testing.T) {
 	client := newR3Client(t)
 	conn := wpConn(t)
@@ -138,15 +141,15 @@ func TestClientEnqueueDefaultVersionIsNull(t *testing.T) {
 		t.Fatalf("query version: %v", err)
 	}
 	if version != nil {
-		t.Errorf("application_version = %q, want NULL (any-version dequeue)", *version)
+		t.Errorf("application_version = %q, want NULL (latest-version dequeue)", *version)
 	}
 }
 
 // TestClientVersionPinningExcludes proves WithClientApplicationVersion restricts
 // execution: a run pinned to a version no worker has stays ENQUEUED.
 func TestClientVersionPinningExcludes(t *testing.T) {
-	worker := launchR3Worker(t, "duro-r3-worker-pin", "r3-real-v")
-	defer worker.Shutdown(5 * time.Second)
+	worker := launchR3Worker(t, "duro-r3-worker", "r3-real-v")
+	defer worker.Close(5 * time.Second)
 	client := newR3Client(t)
 	conn := wpConn(t)
 
@@ -190,8 +193,8 @@ func TestClientStatusUnknownID(t *testing.T) {
 // and go through the engine's mapping: the same listing, the same fields, the
 // same steps, from a process that registers nothing.
 func TestClientListRunsAndStepsParity(t *testing.T) {
-	worker := launchR3Worker(t, "duro-r3-worker-list", "r3-list-v1")
-	defer worker.Shutdown(5 * time.Second)
+	worker := launchR3Worker(t, "duro-r3-worker", "r3-list-v1")
+	defer worker.Close(5 * time.Second)
 	client := newR3Client(t)
 
 	var ids []string
@@ -252,6 +255,62 @@ func TestClientListRunsAndStepsParity(t *testing.T) {
 		if cs[i] != es[i] {
 			t.Errorf("step %d diverges: client=%+v engine=%+v", i, cs[i], es[i])
 		}
+	}
+}
+
+func TestClientApplicationScoping(t *testing.T) {
+	const foreignApp = "duro-r3-foreign"
+	foreign, err := duro.New(context.Background(), duro.Config{
+		Name:        foreignApp,
+		DatabaseURL: testDatabaseURL(),
+		Logger:      quietLogger(),
+	})
+	if err != nil {
+		t.Fatalf("foreign New: %v", err)
+	}
+	foreignWorkflow := duro.Register(foreign, "r3-foreign", r3EchoPipeline())
+	if err := foreign.Launch(); err != nil {
+		t.Fatalf("foreign Launch: %v", err)
+	}
+	defer foreign.Close(5 * time.Second)
+	h, err := foreignWorkflow.Start(foreign, 1)
+	if err != nil {
+		t.Fatalf("foreign Start: %v", err)
+	}
+	if _, err := h.Result(); err != nil {
+		t.Fatalf("foreign Result: %v", err)
+	}
+
+	named := newR3Client(t)
+	runs, err := named.ListRuns(duro.WithNames("r3-foreign"))
+	if err != nil {
+		t.Fatalf("named ListRuns: %v", err)
+	}
+	if len(runs) != 0 {
+		t.Fatalf("named client listed foreign application runs: %+v", runs)
+	}
+	runs, err = named.ListRuns(duro.WithNames("r3-foreign"), duro.WithApplicationNames(foreignApp))
+	if err != nil {
+		t.Fatalf("explicit cross-application ListRuns: %v", err)
+	}
+	if len(runs) != 1 || runs[0].ID != h.ID() || runs[0].ApplicationName != foreignApp {
+		t.Fatalf("explicit foreign listing = %+v, want %s owned by %s", runs, h.ID(), foreignApp)
+	}
+
+	admin, err := duro.NewClient(context.Background(), duro.ClientConfig{
+		DatabaseURL: testDatabaseURL(),
+		Logger:      quietLogger(),
+	})
+	if err != nil {
+		t.Fatalf("admin NewClient: %v", err)
+	}
+	defer admin.Shutdown(5 * time.Second)
+	runs, err = admin.ListRuns(duro.WithNames("r3-foreign"))
+	if err != nil {
+		t.Fatalf("nameless ListRuns: %v", err)
+	}
+	if len(runs) != 1 || runs[0].ID != h.ID() {
+		t.Fatalf("nameless listing = %+v, want foreign run %s", runs, h.ID())
 	}
 }
 
@@ -316,8 +375,8 @@ func TestClientCancelAndResume(t *testing.T) {
 // "duro: run error" while the workers see the real message. Status, StatusAll,
 // ListRuns, and Steps must all carry it from the client.
 func TestClientFailedRunExposesError(t *testing.T) {
-	worker := launchR3Worker(t, "duro-r3-worker-fail", "r3-fail-v1")
-	defer worker.Shutdown(5 * time.Second)
+	worker := launchR3Worker(t, "duro-r3-worker", "r3-fail-v1")
+	defer worker.Close(5 * time.Second)
 	client := newR3Client(t)
 
 	h, err := duro.Enqueue(client, r3Queue, r3Fail, 9, duro.WithClientApplicationVersion("r3-fail-v1"))

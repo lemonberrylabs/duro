@@ -118,7 +118,7 @@ var (
 	wpFanQueue   = NewQueue("wp-fan-queue")
 )
 
-func wpFanChild(_ dbos.DBOSContext, n int) (int, error) {
+func wpFanChild(_ dbos.Context, n int) (int, error) {
 	wpChildCount.Add(1)
 	return n * n, nil
 }
@@ -179,10 +179,10 @@ func newWPFanWorker(t *testing.T, executorID string) (*App, *PipelineWorkflow[in
 
 // crashApp simulates kill -9: it stops the sweeper, stops the heartbeat, and
 // stops the DBOS runtime — but does NOT tombstone the lease (a crash cannot).
-// The ctx-ignoring block step keeps the run PENDING through DBOS's drain, so the
+// The ctx-ignoring block step keeps the run PENDING while DBOS unwinds, so the
 // run is left owned by a now-dead executor whose lease will simply expire.
 //
-// It consumes closeOnce so a deferred App.Shutdown on the crashed app is a
+// It consumes closeOnce so a deferred App.Close on the crashed app is a
 // no-op, rather than tombstoning against a closed pool — a state a real crashed
 // process never reaches.
 func crashApp(a *App) {
@@ -242,7 +242,7 @@ func TestTakeoverCrashDirectStarted(t *testing.T) {
 
 	appA, wfA := newWPWorker(t, "wp-crash-A", wpIVersion)
 	appB, _ := newWPWorker(t, "wp-crash-B", wpIVersion)
-	defer appB.Shutdown(5 * time.Second)
+	defer appB.Close(5 * time.Second)
 
 	h, err := wfA.Start(appA, 5) // direct-started: no queue, started_at is NULL
 	if err != nil {
@@ -287,7 +287,7 @@ func TestTakeoverGracefulShutdownNoStaleWait(t *testing.T) {
 
 	appA, wfA := newWPWorker(t, "wp-graceful-A", wpIVersion, longStale)
 	appB, _ := newWPWorker(t, "wp-graceful-B", wpIVersion, longStale)
-	defer appB.Shutdown(5 * time.Second)
+	defer appB.Close(5 * time.Second)
 
 	h, err := wfA.Start(appA, 5)
 	if err != nil {
@@ -296,7 +296,7 @@ func TestTakeoverGracefulShutdownNoStaleWait(t *testing.T) {
 	runID := h.ID()
 	waitUntil(t, 5*time.Second, "A to reach the block step", func() bool { return wpBlockCount.Load() >= 1 })
 
-	appA.Shutdown(300 * time.Millisecond) // graceful: drains (times out), then tombstones the lease
+	appA.Close(300 * time.Millisecond) // graceful: drains (times out), then tombstones the lease
 	wpReleaseBlocker()
 
 	// Well under the 60s stale threshold — only the tombstone can explain this.
@@ -315,7 +315,7 @@ func TestTakeoverVersionSkewNotAdopted(t *testing.T) {
 
 	appA, wfA := newWPWorker(t, "wp-skew-A", "wp-itest-v1")
 	appB, _ := newWPWorker(t, "wp-skew-B", "wp-itest-v2") // different version
-	defer appB.Shutdown(5 * time.Second)
+	defer appB.Close(5 * time.Second)
 
 	h, err := wfA.Start(appA, 5)
 	if err != nil {
@@ -347,9 +347,9 @@ func TestTakeoverFreshExecutorNotTaken(t *testing.T) {
 	wpResetBlocker()
 
 	appA, wfA := newWPWorker(t, "wp-fresh-A", wpIVersion)
-	defer appA.Shutdown(5 * time.Second)
+	defer appA.Close(5 * time.Second)
 	appB, _ := newWPWorker(t, "wp-fresh-B", wpIVersion)
-	defer appB.Shutdown(5 * time.Second)
+	defer appB.Close(5 * time.Second)
 
 	h, err := wfA.Start(appA, 5)
 	if err != nil {
@@ -388,9 +388,9 @@ func TestTakeoverConcurrentSweepersExactlyOnce(t *testing.T) {
 
 	appA, wfA := newWPWorker(t, "wp-conc-A", wpIVersion)
 	appB, _ := newWPWorker(t, "wp-conc-B", wpIVersion)
-	defer appB.Shutdown(5 * time.Second)
+	defer appB.Close(5 * time.Second)
 	appC, _ := newWPWorker(t, "wp-conc-C", wpIVersion)
-	defer appC.Shutdown(5 * time.Second)
+	defer appC.Close(5 * time.Second)
 
 	h, err := wfA.Start(appA, 5)
 	if err != nil {
@@ -431,7 +431,7 @@ func newWPPoisonWorker(t *testing.T, executorID string) (*App, *PipelineWorkflow
 		t.Fatalf("New poison worker %s: %v", executorID, err)
 	}
 	// maxRetries=1 means DBOS quarantines on the third start attempt.
-	wf := Register(a, "wp-poison", wpBlockingPipeline(), dbos.WithMaxRetries(1))
+	wf := Register(a, "wp-poison", wpBlockingPipeline(), dbos.WithMaxRecoveryAttempts(1))
 	if err := a.Launch(); err != nil {
 		t.Fatalf("Launch poison worker %s: %v", executorID, err)
 	}
@@ -481,7 +481,7 @@ func TestTakeoverQuarantinesPoisonRun(t *testing.T) {
 	}
 	defer func() {
 		for _, a := range live {
-			a.Shutdown(5 * time.Second)
+			a.Close(5 * time.Second)
 		}
 	}()
 
@@ -534,7 +534,7 @@ func TestTakeoverQuarantinesPoisonRun(t *testing.T) {
 //
 // The enqueue pins the fleet's version rather than using the NULL default. This
 // suite's shared app polls every database-backed queue, so it would dequeue a
-// NULL-version (any-version) run it has no registration for and strand it. The
+// NULL-version (latest-version) run it has no registration for and strand it. The
 // NULL default is covered on its own in TestClientEnqueueDefaultVersionIsNull.
 func TestTakeoverClientEnqueuedRun(t *testing.T) {
 	wpResetBlocker()
@@ -542,7 +542,7 @@ func TestTakeoverClientEnqueuedRun(t *testing.T) {
 
 	appA, _ := newWPWorker(t, "wp-client-A", wpIVersion)
 	appB, _ := newWPWorker(t, "wp-client-B", wpIVersion)
-	defer appB.Shutdown(5 * time.Second)
+	defer appB.Close(5 * time.Second)
 
 	// Both workers listen on this queue; the client only enqueues.
 	if err := RegisterQueues(appA, wpClientQueue); err != nil {
@@ -587,7 +587,7 @@ func TestTakeoverClientEnqueuedRun(t *testing.T) {
 	} else {
 		crashApp(appA)
 	}
-	defer survivor.Shutdown(5 * time.Second)
+	defer survivor.Close(5 * time.Second)
 	wpReleaseBlocker()
 
 	waitState(t, survivor, runID, StateSuccess, 20*time.Second)
@@ -600,16 +600,16 @@ func TestTakeoverClientEnqueuedRun(t *testing.T) {
 }
 
 // TestTakeoverHeartbeatThroughDrain guards the corrected shutdown ordering: the
-// heartbeat keeps beating through DBOS's drain, so a run still executing on a
-// draining node is not adopted by a survivor even after the stale threshold
-// elapses. (Stopping the heartbeat before the drain would strand it here.)
+// heartbeat keeps beating while DBOS unwinds, so a run still executing on a
+// stopping node is not adopted by a survivor even after the stale threshold
+// elapses. (Stopping the heartbeat first would strand it here.)
 func TestTakeoverHeartbeatThroughDrain(t *testing.T) {
 	wpResetBlocker()
 	t.Cleanup(wpReleaseBlocker)
 
 	appA, wfA := newWPWorker(t, "wp-drain-A", wpIVersion) // stale threshold 1s
 	appB, _ := newWPWorker(t, "wp-drain-B", wpIVersion)
-	defer appB.Shutdown(5 * time.Second)
+	defer appB.Close(5 * time.Second)
 
 	if _, err := wfA.Start(appA, 5); err != nil {
 		t.Fatalf("start: %v", err)
@@ -619,7 +619,7 @@ func TestTakeoverHeartbeatThroughDrain(t *testing.T) {
 	// Graceful shutdown drains in the background; the ctx-ignoring run keeps the
 	// drain open past the stale threshold.
 	done := make(chan struct{})
-	go func() { appA.Shutdown(3 * time.Second); close(done) }()
+	go func() { appA.Close(3 * time.Second); close(done) }()
 
 	// Across a window well past the 1s stale threshold, A beats through its
 	// drain, so B must not adopt the still-owned run.
@@ -653,7 +653,11 @@ func TestTakeoverReturnsRunToItsQueue(t *testing.T) {
 		}
 	}
 
-	h, err := wfA.Start(appA, 5, dbos.WithQueue(wpLimitedQueue.Name()))
+	queueOpt, err := wpLimitedQueue.WorkflowOption(appA)
+	if err != nil {
+		t.Fatalf("resolve queue: %v", err)
+	}
+	h, err := wfA.Start(appA, 5, queueOpt)
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -675,7 +679,7 @@ func TestTakeoverReturnsRunToItsQueue(t *testing.T) {
 	} else {
 		crashApp(appA)
 	}
-	defer survivor.Shutdown(5 * time.Second)
+	defer survivor.Close(5 * time.Second)
 	wpReleaseBlocker()
 
 	waitState(t, survivor, runID, StateSuccess, 20*time.Second)
@@ -711,7 +715,7 @@ func TestTakeoverFanOutCombination(t *testing.T) {
 
 	appA, wfA := newWPFanWorker(t, "wp-fan-A")
 	appB, _ := newWPFanWorker(t, "wp-fan-B")
-	defer appB.Shutdown(5 * time.Second)
+	defer appB.Close(5 * time.Second)
 
 	h, err := wfA.Start(appA, 4) // items 1..4 → squares 1,4,9,16 → sum 30
 	if err != nil {
@@ -749,7 +753,7 @@ func TestTakeoverFanOutCombination(t *testing.T) {
 // White-box worker-pool tests. They live in package duro so they can drive the
 // takeover UPDATE directly (R2a, against synthetic workflow_status rows) and
 // simulate a hard executor crash (R2b) — stopping a process's heartbeat and
-// DBOS runtime without the graceful tombstone that App.Shutdown writes.
+// DBOS runtime without the graceful tombstone that App.Close writes.
 
 func wpURL() string {
 	if url := os.Getenv("DURO_TEST_DATABASE_URL"); url != "" {
@@ -821,21 +825,29 @@ func TestTakeoverEligibility(t *testing.T) {
 
 	cases := []struct {
 		id, status, executor, version string
+		application                   string // empty deliberately exercises migrated v0 rows
 		wantAdopt                     bool
 	}{
-		{"r2a-dead-pending", "PENDING", "r2a-dead", ver, true},          // stale owner
-		{"r2a-live-pending", "PENDING", "r2a-live", ver, false},         // fresh owner
-		{"r2a-tomb-pending", "PENDING", "r2a-tomb", ver, true},          // tombstoned owner
-		{"r2a-absent-pending", "PENDING", "r2a-absent", ver, false},     // no heartbeat row (unknown)
-		{"r2a-version-skew", "PENDING", "r2a-dead", "r2a-v2", false},    // other version
-		{"r2a-enqueued", "ENQUEUED", "r2a-dead", ver, false},            // not PENDING
-		{"r2a-success", "SUCCESS", "r2a-dead", ver, false},              // terminal
-		{"r2a-cancelled", "CANCELLED", "r2a-dead", ver, false},          // terminal
-		{"r2a-otherapp-pending", "PENDING", "r2a-otherapp", ver, false}, // dead, but a different app
+		{"r2a-dead-pending", "PENDING", "r2a-dead", ver, "", true},                   // stale owner, migrated/unclaimed
+		{"r2a-owned-pending", "PENDING", "r2a-dead", ver, app, true},                 // stale owner, this app
+		{"r2a-foreign-owned", "PENDING", "r2a-dead", ver, "other-app", false},        // same executor/version, different app
+		{"r2a-live-pending", "PENDING", "r2a-live", ver, app, false},                 // fresh owner
+		{"r2a-tomb-pending", "PENDING", "r2a-tomb", ver, app, true},                  // tombstoned owner
+		{"r2a-absent-pending", "PENDING", "r2a-absent", ver, app, false},             // no heartbeat row (unknown)
+		{"r2a-version-skew", "PENDING", "r2a-dead", "r2a-v2", app, false},            // other version
+		{"r2a-enqueued", "ENQUEUED", "r2a-dead", ver, app, false},                    // not PENDING
+		{"r2a-success", "SUCCESS", "r2a-dead", ver, app, false},                      // terminal
+		{"r2a-cancelled", "CANCELLED", "r2a-dead", ver, app, false},                  // terminal
+		{"r2a-otherapp-pending", "PENDING", "r2a-otherapp", ver, "other-app", false}, // dead heartbeat from another app
 	}
 	want := map[string]bool{}
 	for _, c := range cases {
 		seedWorkflow(t, pool, c.id, c.status, c.executor, c.version)
+		if c.application != "" {
+			if _, err := pool.Exec(ctx, "UPDATE dbos.workflow_status SET application_name=$2 WHERE workflow_uuid=$1", c.id, c.application); err != nil {
+				t.Fatalf("set application for %s: %v", c.id, err)
+			}
+		}
 		if c.wantAdopt {
 			want[c.id] = true
 		}
@@ -852,6 +864,15 @@ func TestTakeoverEligibility(t *testing.T) {
 	for _, c := range cases {
 		if got[c.id] != c.wantAdopt {
 			t.Errorf("run %s: adopted=%v, want %v", c.id, got[c.id], c.wantAdopt)
+		}
+		if c.wantAdopt {
+			var application *string
+			if err := pool.QueryRow(ctx, "SELECT application_name FROM dbos.workflow_status WHERE workflow_uuid=$1", c.id).Scan(&application); err != nil {
+				t.Fatalf("read application for %s: %v", c.id, err)
+			}
+			if application == nil || *application != app {
+				t.Errorf("run %s: application = %v, want takeover to claim %q", c.id, application, app)
+			}
 		}
 	}
 

@@ -95,7 +95,7 @@ func queryHeartbeat(t *testing.T, conn *pgx.Conn, executorID string) (time.Time,
 func TestWorkerPoolHeartbeatWritten(t *testing.T) {
 	execID := "wp-hb-written"
 	a := newWorkerPoolApp(t, execID, wpTestVersion)
-	defer a.Shutdown(5 * time.Second)
+	defer a.Close(5 * time.Second)
 
 	last, ok := queryHeartbeat(t, wpConn(t), execID)
 	if !ok {
@@ -111,7 +111,7 @@ func TestWorkerPoolHeartbeatWritten(t *testing.T) {
 func TestWorkerPoolHeartbeatAdvances(t *testing.T) {
 	execID := "wp-hb-advances"
 	a := newWorkerPoolApp(t, execID, wpTestVersion)
-	defer a.Shutdown(5 * time.Second)
+	defer a.Close(5 * time.Second)
 	conn := wpConn(t)
 
 	first, ok := queryHeartbeat(t, conn, execID)
@@ -139,7 +139,7 @@ func TestWorkerPoolTombstoneOnShutdown(t *testing.T) {
 		t.Fatal("no heartbeat before shutdown")
 	}
 
-	a.Shutdown(5 * time.Second)
+	a.Close(5 * time.Second)
 
 	last, ok := queryHeartbeat(t, conn, execID)
 	if !ok {
@@ -155,9 +155,9 @@ func TestWorkerPoolTombstoneOnShutdown(t *testing.T) {
 // executors ever recognizing each other as separate.
 func TestWorkerPoolGeneratesUniqueExecutorID(t *testing.T) {
 	a := newWorkerPoolApp(t, "", wpTestVersion)
-	defer a.Shutdown(5 * time.Second)
+	defer a.Close(5 * time.Second)
 	b := newWorkerPoolApp(t, "", wpTestVersion)
-	defer b.Shutdown(5 * time.Second)
+	defer b.Close(5 * time.Second)
 
 	idA, idB := a.Context().GetExecutorID(), b.Context().GetExecutorID()
 	if idA == "" || idA == "local" {
@@ -172,7 +172,7 @@ func TestWorkerPoolGeneratesUniqueExecutorID(t *testing.T) {
 // over generation.
 func TestWorkerPoolExplicitExecutorID(t *testing.T) {
 	a := newWorkerPoolApp(t, "explicit-exec-1", wpTestVersion)
-	defer a.Shutdown(5 * time.Second)
+	defer a.Close(5 * time.Second)
 	if got := a.Context().GetExecutorID(); got != "explicit-exec-1" {
 		t.Errorf("executor id = %q, want explicit %q", got, "explicit-exec-1")
 	}

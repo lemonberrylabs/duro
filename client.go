@@ -18,24 +18,22 @@ import (
 // same mapping as the engine (Status/StatusAll), so a client and the workers
 // can never disagree on what a run's state — or "terminal" — means.
 //
-//	c, err := duro.NewClient(ctx, duro.ClientConfig{DatabaseURL: url})
+//	c, err := duro.NewClient(ctx, duro.ClientConfig{DatabaseURL: url, ApplicationName: "orders"})
 //	defer c.Shutdown(5 * time.Second)
 //	h, err := duro.Enqueue(c, Jobs, InvoiceJob, batch)
 //	status, err := c.Status(h.ID())
 type Client struct {
-	// c is the enqueue path: dbos.Client is the only way to enqueue a run
-	// this process has not registered. It exposes no context, so nothing on
-	// it can be bounded — which is why reads do not go through it.
+	// c is the enqueue and management path. DBOS v1's NewClient returns its
+	// unlaunched context behind the narrower Client interface.
 	c dbos.Client
-	// pool is duro's own connection pool to the system database. The read
-	// context runs on it, and Resume's guarded transition executes on it.
+	// pool is shared by DBOS and Resume's guarded transition.
 	pool *pgxpool.Pool
-	// reads is a duro-owned DBOS context on pool, never launched. Every
+	// reads is the DBOS client's underlying, never-launched context. Every
 	// public read or remediation call derives one bounded child of it, so a
 	// database outage costs a call its timeout instead of a goroutine
 	// forever. It is the same context type the engine's functions run on, so
 	// the client and the workers share one code path exactly.
-	reads       dbos.DBOSContext
+	reads       dbos.Context
 	readTimeout time.Duration
 	// bound is nil on the client NewClient returns; a WithContext view carries
 	// the caller's context here and every read observes it as well.
@@ -52,6 +50,12 @@ type ClientConfig struct {
 	// DatabaseURL is the Postgres URL of the DBOS system database — the same one
 	// the workers use.
 	DatabaseURL string
+	// ApplicationName scopes reads and writes to one DBOS application. It
+	// should normally equal the workers' Config.Name. Empty retains DBOS's
+	// nameless administrative mode, which can list and modify every application
+	// sharing the database and enqueues unclaimed work for a queue owner to
+	// adopt.
+	ApplicationName string
 	// Logger receives client and DBOS logs; slog.Default() when nil.
 	Logger *slog.Logger
 	// ReadTimeout bounds every read and remediation call — Status, StatusAll,
@@ -64,8 +68,8 @@ type ClientConfig struct {
 	// it below your request deadline and page ListRuns so no single call
 	// needs longer. Negative is an error.
 	//
-	// It does not cover Enqueue, or waiting on a Handle: dbos.Client offers
-	// no context for those.
+	// It does not cover Enqueue or waiting on a Handle; those operations use
+	// the client's lifecycle context rather than a per-call context.
 	ReadTimeout time.Duration
 }
 
@@ -85,29 +89,26 @@ func NewClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	c, err := dbos.NewClient(ctx, dbos.ClientConfig{
-		DatabaseURL: cfg.DatabaseURL,
-		Logger:      logger,
-	})
-	if err != nil {
-		return nil, err
-	}
 	pool, err := newClientPool(ctx, cfg.DatabaseURL)
 	if err != nil {
-		c.Shutdown(5 * time.Second)
 		return nil, err
 	}
-	// The read context is deliberately never launched: launching starts
-	// recovery and queue runners, and this process must never execute a run.
-	reads, err := dbos.NewDBOSContext(ctx, dbos.Config{
-		AppName:      "duro-client",
+	c, err := dbos.NewClient(ctx, dbos.ClientConfig{
 		SystemDBPool: pool,
+		AppName:      cfg.ApplicationName,
 		Logger:       logger,
 	})
 	if err != nil {
 		pool.Close()
-		c.Shutdown(5 * time.Second)
 		return nil, err
+	}
+	// NewClient currently constructs the same concrete context as NewContext,
+	// but intentionally returns its unlaunched Client subset. Retain the
+	// context only to derive bounded management calls; never Launch it.
+	reads, ok := c.(dbos.Context)
+	if !ok {
+		_ = dbos.Shutdown(c, 5*time.Second)
+		return nil, errors.New("duro: DBOS client does not expose a context for bounded reads")
 	}
 	return &Client{c: c, pool: pool, reads: reads, readTimeout: readTimeout, logger: logger}, nil
 }
@@ -139,11 +140,7 @@ func newClientPool(ctx context.Context, databaseURL string) (*pgxpool.Pool, erro
 // system-database connections. WithContext views share those connections, so
 // Shutdown on any of them closes the client for all. Calling it more than
 // once is safe.
-func (c *Client) Shutdown(timeout time.Duration) {
-	dbos.Shutdown(c.reads, timeout)
-	c.c.Shutdown(timeout)
-	c.pool.Close()
-}
+func (c *Client) Shutdown(timeout time.Duration) error { return dbos.Shutdown(c.c, timeout) }
 
 // WithContext returns a view of the client whose reads and remediations are
 // bounded by ctx as well as by ReadTimeout — the seam for a request handler:
@@ -155,8 +152,7 @@ func (c *Client) Shutdown(timeout time.Duration) {
 // context.Canceled, so HTTP timeout classification sees the right cause.
 //
 // The view shares the client's connections and its enqueue path; Enqueue and
-// Handle waits are not bounded by ctx (dbos.Client offers no context for
-// them). ctx must be non-nil.
+// Handle waits are not bounded by ctx. ctx must be non-nil.
 func (c *Client) WithContext(ctx context.Context) *Client {
 	if ctx == nil {
 		panic("duro: Client.WithContext requires a non-nil context")
@@ -169,7 +165,7 @@ func (c *Client) WithContext(ctx context.Context) *Client {
 // readContext derives the bounded DBOS context one public call runs on —
 // every query that call issues shares it: the read timeout, tightened by the
 // WithContext caller's context when there is one.
-func (c *Client) readContext() (dbos.DBOSContext, context.CancelFunc) {
+func (c *Client) readContext() (dbos.Context, context.CancelFunc) {
 	return boundContext(c.reads, c.bound, c.readTimeout)
 }
 
@@ -177,7 +173,7 @@ func (c *Client) readContext() (dbos.DBOSContext, context.CancelFunc) {
 // and bound's deadline, and ends early if bound is cancelled. bound may be
 // nil. A deadline surfaces as context.DeadlineExceeded and a cancellation as
 // context.Canceled, whichever side it came from.
-func boundContext(parent dbos.DBOSContext, bound context.Context, timeout time.Duration) (dbos.DBOSContext, context.CancelFunc) {
+func boundContext(parent dbos.Context, bound context.Context, timeout time.Duration) (dbos.Context, context.CancelFunc) {
 	if bound != nil {
 		if deadline, ok := bound.Deadline(); ok {
 			if until := time.Until(deadline); until < timeout {
@@ -207,7 +203,7 @@ func boundContext(parent dbos.DBOSContext, bound context.Context, timeout time.D
 // storeOn is the runStore a public call runs on: the engine's adapter over
 // the call's bounded context and the client's pool — one code path with the
 // workers, so the two cannot report or treat runs differently.
-func (c *Client) storeOn(dctx dbos.DBOSContext) runStore {
+func (c *Client) storeOn(dctx dbos.Context) runStore {
 	return engineStore(dctx, poolExec(c.pool))
 }
 
@@ -222,9 +218,9 @@ type EnqueueOption func(*enqueueConfig)
 
 // WithClientApplicationVersion pins the enqueued run to a specific application
 // version, so only workers on that version dequeue it. By default a client
-// stamps no version (NULL), meaning any worker version may run it — the right
-// default for a web tier that should not need redeploying in lockstep with the
-// workers.
+// stamps no version (NULL), which DBOS routes to the owning application's
+// latest registered version — the right default for a web tier that should not
+// need redeploying in lockstep with the workers.
 func WithClientApplicationVersion(version string) EnqueueOption {
 	return func(c *enqueueConfig) { c.appVersion = version }
 }
@@ -243,8 +239,9 @@ func WithClientWorkflowID(id string) EnqueueOption {
 // RegisterJob. The run is serialized identically to an engine-side enqueue, so
 // workers decode it transparently.
 //
-// By default no application version is stamped (any worker version may run it);
-// override with WithClientApplicationVersion.
+// By default no application version is stamped, so DBOS routes the run to the
+// owning application's latest registered version; override with
+// WithClientApplicationVersion to pin an exact version.
 func Enqueue[P, R any](c *Client, queue Queue, job Job[P, R], input P, opts ...EnqueueOption) (Handle[R], error) {
 	if c == nil {
 		return Handle[R]{}, errors.New("duro: Enqueue requires a non-nil client")
@@ -265,16 +262,14 @@ func Enqueue[P, R any](c *Client, queue Queue, job Job[P, R], input P, opts ...E
 		// so stamp the config name to match, or the run would never dispatch.
 		dbos.WithEnqueueConfigName(job.Name()),
 		// Stamp no application version by default (empty → NULL in the database),
-		// so any worker version may dequeue it. dbos otherwise defaults to the
-		// client's own version — and the client, being a different binary from the
-		// workers, would stamp a version no worker has, stranding every run.
-		// WithClientApplicationVersion overrides this to pin a version.
+		// so DBOS routes it to the owning application's latest registered version.
+		// WithClientApplicationVersion overrides this to pin an exact version.
 		dbos.WithEnqueueApplicationVersion(cfg.appVersion),
 	}
 	if cfg.workflowID != "" {
 		dopts = append(dopts, dbos.WithEnqueueWorkflowID(cfg.workflowID))
 	}
-	return newHandle(dbos.Enqueue[P, R](c.c, queue.Name(), job.Name(), input, dopts...))
+	return newHandle(dbos.Enqueue[R](c.c, queue.Name(), job.Name(), input, dopts...))
 }
 
 // Status fetches a run's current status by workflow ID, using the same mapping
@@ -293,8 +288,9 @@ func (c *Client) StatusAll(workflowIDs ...string) ([]RunStatus, error) {
 }
 
 // ListRuns lists durable runs with the same options, mapping, and failed-run
-// treatment as the engine's ListRuns — an admin tier's view of every run in
-// the system, from a process that registers no workflows.
+// treatment as the engine's ListRuns. A named client sees its application plus
+// migrated unclaimed rows by default; a nameless administrative client sees
+// every application.
 func (c *Client) ListRuns(opts ...ListOption) ([]RunStatus, error) {
 	dctx, done := c.readContext()
 	defer done()

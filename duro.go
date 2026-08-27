@@ -96,7 +96,7 @@ import (
 // workflows never requires importing dbos:
 //
 //	func Process(ctx duro.Context, job Job) (Result, error)
-type Context = dbos.DBOSContext
+type Context = dbos.Context
 
 // WorkflowFunc is a hand-written durable workflow function, the kind
 // RegisterWorkflow registers and Workflow adapts into a FanOut child.
@@ -219,21 +219,23 @@ func newStepConfig(name string, opts []StepOption) stepConfig {
 func WithMaxRetries(n int) StepOption { return stepOption(dbos.WithStepMaxRetries(n)) }
 
 // WithBaseInterval sets the initial delay between retries (default 100ms).
-func WithBaseInterval(d time.Duration) StepOption { return stepOption(dbos.WithBaseInterval(d)) }
+func WithBaseInterval(d time.Duration) StepOption { return stepOption(dbos.WithStepBaseInterval(d)) }
 
 // WithMaxInterval caps the delay between retries (default 5s).
-func WithMaxInterval(d time.Duration) StepOption { return stepOption(dbos.WithMaxInterval(d)) }
+func WithMaxInterval(d time.Duration) StepOption { return stepOption(dbos.WithStepMaxInterval(d)) }
 
 // WithBackoffFactor sets the exponential multiplier applied to the retry
 // delay after each attempt (default 2.0).
-func WithBackoffFactor(factor float64) StepOption { return stepOption(dbos.WithBackoffFactor(factor)) }
+func WithBackoffFactor(factor float64) StepOption {
+	return stepOption(dbos.WithStepBackoffFactor(factor))
+}
 
 // WithRetryPredicate restricts which errors are retried: when the stage
 // function returns an error for which pred is false, the stage stops
 // immediately with that error even if retries remain. Use it to spend
 // retries on transient failures only.
 func WithRetryPredicate(pred func(error) bool) StepOption {
-	return stepOption(dbos.WithRetryPredicate(pred))
+	return stepOption(dbos.WithStepRetryPredicate(pred))
 }
 
 // WithTimeout bounds each execution attempt of the stage function: the step
@@ -481,10 +483,10 @@ func UnsafeOperator[T, R any](name string, op func(ro.Observable[T]) ro.Observab
 	return Stage[T, R]{name: name, kind: kindUnsafe, apply: op}
 }
 
-// pipelineState carries the workflow's DBOSContext, the subscribing
+// pipelineState carries the workflow's DBOS Context, the subscribing
 // goroutine, and a shared abort flag through the observable chain.
 type pipelineState struct {
-	dctx    dbos.DBOSContext
+	dctx    dbos.Context
 	gid     uint64
 	aborted atomic.Bool
 }

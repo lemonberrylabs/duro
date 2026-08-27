@@ -50,7 +50,7 @@ func currentGate() chan struct{} {
 	return gateCh
 }
 
-func gateWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
+func gateWorkflow(ctx dbos.Context, n int) (int, error) {
 	return duro.Run(ctx, n, duro.Pipe2(
 		duro.Step("gate", func(ctx context.Context, v int) (int, error) {
 			gateRuns.Add(1)
@@ -68,7 +68,7 @@ func gateWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
 	))
 }
 
-func registerControlWorkflows(ctx dbos.DBOSContext) {
+func registerControlWorkflows(ctx dbos.Context) {
 	dbos.RegisterWorkflow(ctx, gateWorkflow, dbos.WithWorkflowName("gateWorkflow"))
 }
 
@@ -96,9 +96,13 @@ func awaitState(t *testing.T, id string, pred func(duro.State) bool) duro.RunSta
 // executor has, so it exists but never starts — the enqueued-and-waiting case.
 func startPinnedToNobody(t *testing.T, id string) {
 	t.Helper()
+	queueOpt, err := fanQueue.WorkflowOption(app)
+	if err != nil {
+		t.Fatalf("resolving queue: %v", err)
+	}
 	if _, err := registeredWf.Start(app, 1,
 		dbos.WithWorkflowID(id),
-		dbos.WithQueue(fanQueueName),
+		queueOpt,
 		dbos.WithApplicationVersion("control-version-nobody-has")); err != nil {
 		t.Fatalf("enqueuing pinned run: %v", err)
 	}
@@ -387,7 +391,11 @@ func queueNameOf(t *testing.T, id string) string {
 // checkpointed stages replay rather than re-execute. It also proves the
 // retries_exceeded state round-trips through Status and a WithStates filter.
 func TestResumeReturnsRunToItsQueue(t *testing.T) {
-	h, err := registeredWf.Start(app, 5, dbos.WithQueue(fanQueueName))
+	queueOpt, err := fanQueue.WorkflowOption(app)
+	if err != nil {
+		t.Fatalf("resolving queue: %v", err)
+	}
+	h, err := registeredWf.Start(app, 5, queueOpt)
 	if err != nil {
 		t.Fatalf("starting: %v", err)
 	}

@@ -28,7 +28,7 @@ func main() {
 	if err := app.Launch(); err != nil {
 		fatal("launching: %v", err)
 	}
-	defer app.Shutdown(5 * time.Second)
+	defer app.Close(5 * time.Second)
 
 	batch := []Ticket{
 		{ID: "t-1", Category: "billing"},

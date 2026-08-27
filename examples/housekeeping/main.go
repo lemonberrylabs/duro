@@ -45,16 +45,16 @@ func main() {
 	if err := app.Launch(); err != nil {
 		fatal("launching: %v", err)
 	}
-	defer app.Shutdown(5 * time.Second)
+	defer app.Close(5 * time.Second)
 
 	switch *stranded {
 	case "start":
 		if _, err := welcome.Start(app, "", duro.WithWorkflowID(welcomeRunID)); err != nil {
 			fatal("starting welcome run: %v", err)
 		}
-		fmt.Printf("started %q (parked in Recv) — exiting like a crash so it stays PENDING\n", welcomeRunID)
+		fmt.Printf("started %q (parked in Recv) — closing gracefully; DBOS v1 leaves it PENDING for recovery\n", welcomeRunID)
 		fmt.Println("now run with -stranded=renamed")
-		os.Exit(0) // skip the deferred Shutdown: a graceful drain would abort the parked Recv
+		return
 	case "renamed":
 		fmt.Println("registered the pipeline as \"welcome-v2\" — the warning above is app.Launch()")
 		fmt.Println("finding the in-flight run recorded under \"welcome\". Run -stranded=reattach to fix it.")

@@ -47,7 +47,7 @@ func main() {
 	if err := app.Launch(); err != nil {
 		fatal("launching DBOS: %v", err)
 	}
-	defer app.Shutdown(5 * time.Second)
+	defer app.Close(5 * time.Second)
 
 	// A crashed demo from a previous run is recovered automatically at Launch;
 	// report it before running anything new.
@@ -85,7 +85,7 @@ func main() {
 	}
 }
 
-func runBatch(dctx dbos.DBOSContext, wf dbos.Workflow[Batch, Invoice], batchID string) {
+func runBatch(dctx dbos.Context, wf dbos.Workflow[Batch, Invoice], batchID string) {
 	batch := Batch{
 		ID: batchID,
 		Items: []LineItem{
@@ -107,7 +107,7 @@ func runBatch(dctx dbos.DBOSContext, wf dbos.Workflow[Batch, Invoice], batchID s
 	printSteps(dctx, handle.GetWorkflowID())
 }
 
-func runOrder(dctx dbos.DBOSContext, wf dbos.Workflow[Order, Confirmation], order Order, opts ...dbos.WorkflowOption) {
+func runOrder(dctx dbos.Context, wf dbos.Workflow[Order, Confirmation], order Order, opts ...dbos.WorkflowOption) {
 	handle, err := dbos.RunWorkflow(dctx, wf, order, opts...)
 	if err != nil {
 		fatal("starting order workflow: %v", err)
@@ -125,7 +125,7 @@ func runOrder(dctx dbos.DBOSContext, wf dbos.Workflow[Order, Confirmation], orde
 // completed demo workflow from an earlier crash/recovery cycle is deleted
 // first so the demo is repeatable — otherwise DBOS would return its recorded
 // result instead of executing.
-func runCrashDemo(dctx dbos.DBOSContext, variant string) {
+func runCrashDemo(dctx dbos.Context, variant string) {
 	wf, wfID := dbos.Workflow[Order, Confirmation](OrderWorkflowRo), crashDemoWorkflowIDDuro
 	if variant == "plain" {
 		wf, wfID = OrderWorkflow, crashDemoWorkflowIDPlain
@@ -140,10 +140,10 @@ func runCrashDemo(dctx dbos.DBOSContext, variant string) {
 // reportRecoveredCrashDemos waits for crash-demo workflows left PENDING by a
 // previous run; DBOS re-executes them on Launch, replaying completed steps
 // from their checkpoints.
-func reportRecoveredCrashDemos(dctx dbos.DBOSContext) {
+func reportRecoveredCrashDemos(dctx dbos.Context) {
 	pending, err := dbos.ListWorkflows(dctx,
-		dbos.WithWorkflowIDPrefix("order-crash-"),
-		dbos.WithStatus([]dbos.WorkflowStatusType{dbos.WorkflowStatusPending}),
+		dbos.WithFilterWorkflowIDPrefix("order-crash-"),
+		dbos.WithFilterStatus(dbos.WorkflowStatusPending),
 	)
 	if err != nil || len(pending) == 0 {
 		return
@@ -166,7 +166,7 @@ func reportRecoveredCrashDemos(dctx dbos.DBOSContext) {
 	}
 }
 
-func printSteps(dctx dbos.DBOSContext, workflowID string) {
+func printSteps(dctx dbos.Context, workflowID string) {
 	steps, err := dbos.GetWorkflowSteps(dctx, workflowID)
 	if err != nil {
 		fatal("fetching steps for %s: %v", workflowID, err)

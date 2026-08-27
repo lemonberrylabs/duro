@@ -323,8 +323,9 @@ func TestSteps(t *testing.T) {
 // run named CancelWatcherName on the CancelWatchQueueName queue, parented to
 // the batch's run — visible to an operator, and filterable by name.
 func TestListRunsIncludesCancelWatcher(t *testing.T) {
-	if duro.CancelWatcherName != "duro.cancel-watcher" || duro.CancelWatchQueueName != "duro.cancel-watch" {
-		t.Fatalf("watcher identities = %q/%q: these are durable names and must never change", duro.CancelWatcherName, duro.CancelWatchQueueName)
+	watchQueue := duro.CancelWatchQueueNameFor("duro-test")
+	if duro.CancelWatcherName != "duro.cancel-watcher" || watchQueue != "duro.cancel-watch.duro-test" {
+		t.Fatalf("watcher identities = %q/%q: these are durable names and must never change", duro.CancelWatcherName, watchQueue)
 	}
 	h, err := dbos.RunWorkflow(dctx, fanCancelShortWorkflow, []int{7001, 7002})
 	if err != nil {
@@ -340,7 +341,7 @@ func TestListRunsIncludesCancelWatcher(t *testing.T) {
 
 	watchers, err := duro.ListRuns(app,
 		duro.WithNames(duro.CancelWatcherName),
-		duro.WithQueue(duro.CancelWatchQueueName),
+		duro.WithQueue(watchQueue),
 		duro.WithCreatedAfter(parent.CreatedAt))
 	if err != nil {
 		t.Fatalf("ListRuns: %v", err)
@@ -351,8 +352,8 @@ func TestListRunsIncludesCancelWatcher(t *testing.T) {
 			mine = append(mine, w)
 		}
 	}
-	if len(mine) != 1 || mine[0].Name != duro.CancelWatcherName || mine[0].QueueName != duro.CancelWatchQueueName {
-		t.Errorf("watchers of %s = %+v, want exactly one named %s on %s", parent.ID, mine, duro.CancelWatcherName, duro.CancelWatchQueueName)
+	if len(mine) != 1 || mine[0].Name != duro.CancelWatcherName || mine[0].QueueName != watchQueue {
+		t.Errorf("watchers of %s = %+v, want exactly one named %s on %s", parent.ID, mine, duro.CancelWatcherName, watchQueue)
 	}
 	steps, err := duro.Steps(app, parent.ID)
 	if err != nil {

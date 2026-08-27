@@ -2,10 +2,91 @@ package duro
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/dbos-inc/dbos-transact-golang/dbos"
 )
+
+const scheduledPipelineWorkflowName = "duro.scheduled-pipeline"
+
+type scheduledPipelineRunner func(Context, time.Time) (any, error)
+
+type scheduledPipelineEntry struct {
+	fingerprint string
+	run         scheduledPipelineRunner
+}
+
+type scheduleLedger struct {
+	mu                   sync.Mutex
+	dispatcherRegistered bool
+	byName               map[string]scheduledPipelineRegistration
+}
+
+type scheduledPipelineRegistration struct {
+	spec  dbos.ScheduleSpec
+	entry scheduledPipelineEntry
+}
+
+var scheduleLedgers sync.Map // applicationRegistryKey(ctx) -> *scheduleLedger
+
+func scheduledPipelineDispatcher(ledger *scheduleLedger) dbos.Workflow[dbos.ScheduledWorkflowInput, any] {
+	return func(ctx Context, input dbos.ScheduledWorkflowInput) (any, error) {
+		name, err := dbos.DecodeScheduleContext[string](input)
+		if err != nil {
+			return nil, fmt.Errorf("duro: decoding scheduled pipeline identity: %w", err)
+		}
+		ledger.mu.Lock()
+		registration, ok := ledger.byName[name]
+		ledger.mu.Unlock()
+		if !ok {
+			return nil, fmt.Errorf("duro: scheduled pipeline %q is not registered for application %q", name, applicationNameFromContext(ctx))
+		}
+		return registration.entry.run(ctx, input.ScheduledTime)
+	}
+}
+
+func registerSchedule(ctx Context, spec dbos.ScheduleSpec, pipeline scheduledPipelineEntry) error {
+	ctx = unwrapContext(ctx)
+	entry, _ := scheduleLedgers.LoadOrStore(applicationRegistryKey(ctx), &scheduleLedger{byName: make(map[string]scheduledPipelineRegistration)})
+	ledger := entry.(*scheduleLedger)
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	if !ledger.dispatcherRegistered {
+		dbos.RegisterWorkflow(ctx, scheduledPipelineDispatcher(ledger), dbos.WithWorkflowName(scheduledPipelineWorkflowName))
+		ledger.dispatcherRegistered = true
+	}
+	if existing, ok := ledger.byName[spec.ScheduleName]; ok {
+		if existing.spec.Schedule != spec.Schedule || existing.spec.WorkflowName != spec.WorkflowName || existing.spec.Context != spec.Context || existing.entry.fingerprint != pipeline.fingerprint {
+			return fmt.Errorf("schedule %q registered twice with different definitions", spec.ScheduleName)
+		}
+		return nil
+	}
+	ledger.byName[spec.ScheduleName] = scheduledPipelineRegistration{spec: spec, entry: pipeline}
+	return nil
+}
+
+// ApplySchedules persists every schedule declared by RegisterScheduled on ctx.
+// App.Launch calls it automatically. Call it yourself immediately after
+// dbos.Launch only when using a hand-built DBOS Context instead of Duro's App.
+func ApplySchedules(ctx Context) error {
+	ctx = unwrapContext(ctx)
+	if ctx == nil {
+		return fmt.Errorf("duro: ApplySchedules requires a non-nil context")
+	}
+	value, ok := scheduleLedgers.Load(applicationRegistryKey(ctx))
+	if !ok {
+		return nil
+	}
+	ledger := value.(*scheduleLedger)
+	ledger.mu.Lock()
+	specs := make([]dbos.ScheduleSpec, 0, len(ledger.byName))
+	for _, registration := range ledger.byName {
+		specs = append(specs, registration.spec)
+	}
+	ledger.mu.Unlock()
+	return dbos.ApplySchedules(ctx, specs)
+}
 
 // PipelineWorkflow is a pipeline registered as a DBOS workflow. Every
 // registration shares one generic runner method, so DBOS's configured
@@ -93,7 +174,7 @@ func (w *PipelineWorkflow[P, R]) Start(ctx Context, in P, opts ...WorkflowOption
 // Register turns a pipeline into a registered DBOS workflow under the given
 // name, and registers every queue the pipeline references. Call it after New
 // and before Launch; run the result with Start. Workflow-level registration
-// options (recovery attempts via dbos.WithMaxRetries, ...) pass through opts.
+// options (recovery attempts via dbos.WithMaxRecoveryAttempts, ...) pass through opts.
 //
 // The name is the pipeline's durable identity: in-flight runs are recovered
 // by looking it up, so it must be registered on every process start. Launch
@@ -129,17 +210,37 @@ func RegisterJob[P, R any](ctx Context, job Job[P, R], p Pipeline[P, R], opts ..
 // schedule uses cron syntax with seconds precision ("*/30 * * * * *" = every
 // 30 seconds). Requiring Pipeline[time.Time, R] makes the DBOS rule that
 // scheduled workflows take a time.Time input a compile-time guarantee.
+//
+// opts configure the returned pipeline workflow when it is started manually.
+// DBOS v1 database schedules invoke Duro's shared adapter workflow, whose
+// recovery-attempt budget is DBOS's default.
 func RegisterScheduled[R any](ctx Context, name, cronSchedule string, p Pipeline[time.Time, R], opts ...WorkflowRegistrationOption) *PipelineWorkflow[time.Time, R] {
 	if cronSchedule == "" {
 		panic(fmt.Sprintf("duro: RegisterScheduled %q requires a cron schedule", name))
 	}
-	return Register(ctx, name, p, append([]dbos.WorkflowRegistrationOption{dbos.WithSchedule(cronSchedule)}, opts...)...)
+	ctx = unwrapContext(ctx)
+	w := Register(ctx, name, p, opts...)
+	entry := scheduledPipelineEntry{
+		fingerprint: p.fingerprint(),
+		run: func(ctx Context, scheduledTime time.Time) (any, error) {
+			return Run(ctx, scheduledTime, p)
+		},
+	}
+	if err := registerSchedule(ctx, dbos.ScheduleSpec{
+		ScheduleName: name,
+		Schedule:     cronSchedule,
+		WorkflowName: scheduledPipelineWorkflowName,
+		Context:      name,
+	}, entry); err != nil {
+		panic(fmt.Sprintf("duro: RegisterScheduled %q: %v", name, err))
+	}
+	return w
 }
 
 // Debouncer collapses bursts of pipeline starts into a single run; see
 // RegisterDebounced.
 type Debouncer[P, R any] struct {
-	d *dbos.Debouncer[P, R]
+	d *dbos.Debouncer[R, P]
 }
 
 // Debounce postpones the pipeline's start by delay. Every further call with
@@ -156,7 +257,11 @@ func (d *Debouncer[P, R]) Debounce(ctx Context, key string, delay time.Duration,
 func RegisterDebounced[P, R any](ctx Context, name string, p Pipeline[P, R], opts ...dbos.DebouncerOption) *Debouncer[P, R] {
 	ctx = unwrapContext(ctx)
 	w := Register(ctx, name, p)
-	return &Debouncer[P, R]{d: dbos.NewDebouncer(ctx, w.wf, append([]dbos.DebouncerOption{dbos.WithDebouncerInstance(w)}, opts...)...)}
+	d, err := dbos.NewDebouncer(ctx, w.wf, append([]dbos.DebouncerOption{dbos.WithDebouncerInstance(w)}, opts...)...)
+	if err != nil {
+		panic(fmt.Sprintf("duro: RegisterDebounced %q: %v", name, err))
+	}
+	return &Debouncer[P, R]{d: d}
 }
 
 // mustValidPipelineWorkflow panics when a pipeline-workflow registration is

@@ -29,7 +29,7 @@ import (
 
 var (
 	app  *duro.App
-	dctx dbos.DBOSContext
+	dctx dbos.Context
 )
 
 func TestMain(m *testing.M) {
@@ -100,7 +100,7 @@ func TestMain(m *testing.M) {
 	dctx = ctx
 
 	code := m.Run()
-	app.Shutdown(10 * time.Second)
+	app.Close(10 * time.Second)
 	os.Exit(code)
 }
 
@@ -148,7 +148,7 @@ var (
 	sumCount     atomic.Int64
 )
 
-func linearWorkflow(ctx dbos.DBOSContext, n int) (string, error) {
+func linearWorkflow(ctx dbos.Context, n int) (string, error) {
 	return duro.Run(ctx, n, duro.Pipe3(
 		duro.Step("double", func(_ context.Context, v int) (int, error) {
 			doubleCount.Add(1)
@@ -167,7 +167,7 @@ func linearWorkflow(ctx dbos.DBOSContext, n int) (string, error) {
 
 // plainLinearWorkflow performs the same computation as linearWorkflow with
 // sequential RunAsStep calls, for step-sequence parity checks.
-func plainLinearWorkflow(ctx dbos.DBOSContext, n int) (string, error) {
+func plainLinearWorkflow(ctx dbos.Context, n int) (string, error) {
 	doubled, err := dbos.RunAsStep(ctx, func(context.Context) (int, error) {
 		return n * 2, nil
 	}, dbos.WithStepName("double"))
@@ -185,7 +185,7 @@ func plainLinearWorkflow(ctx dbos.DBOSContext, n int) (string, error) {
 	}, dbos.WithStepName("stringify"))
 }
 
-func flakyWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
+func flakyWorkflow(ctx dbos.Context, n int) (int, error) {
 	return duro.Run(ctx, n, duro.Pipe1(
 		duro.Step("flaky", func(_ context.Context, v int) (int, error) {
 			if flakyAttempts.Add(1) < 3 {
@@ -199,7 +199,7 @@ func flakyWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
 // midstreamFailureWorkflow expands into three items and fails on the second,
 // verifying that a mid-stream error stops the pipeline: the third item must
 // never reach any stage.
-func midstreamFailureWorkflow(ctx dbos.DBOSContext, _ int) (int, error) {
+func midstreamFailureWorkflow(ctx dbos.Context, _ int) (int, error) {
 	return duro.Run(ctx, []int{1, 2, 3}, duro.Pipe4(
 		duro.Expand("explode", func(_ context.Context, xs []int) ([]int, error) {
 			return xs, nil
@@ -226,7 +226,7 @@ func midstreamFailureWorkflow(ctx dbos.DBOSContext, _ int) (int, error) {
 // Expand → Filter → Step → Tap → Reduce, with a Pure reshaping stage that is
 // never checkpointed. For input [1 2 3 4 5] it keeps the odd values, squares
 // them, and sums to 35.
-func complexPipelineWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
+func complexPipelineWorkflow(ctx dbos.Context, ns []int) (int, error) {
 	return duro.Run(ctx, ns, duro.Pipe6(
 		duro.Expand("explode", func(_ context.Context, xs []int) ([]int, error) {
 			explodeCount.Add(1)
@@ -252,7 +252,7 @@ func complexPipelineWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
 	))
 }
 
-func dropAllWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
+func dropAllWorkflow(ctx dbos.Context, n int) (int, error) {
 	return duro.Run(ctx, n, duro.Pipe1(
 		duro.Filter("drop-all", func(_ context.Context, _ int) (bool, error) {
 			return false, nil
@@ -260,7 +260,7 @@ func dropAllWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
 	))
 }
 
-func multiValueWorkflow(ctx dbos.DBOSContext, n int) ([]int, error) {
+func multiValueWorkflow(ctx dbos.Context, n int) ([]int, error) {
 	return duro.RunAll(ctx, n, duro.Pipe2(
 		duro.Expand("one-to-n", func(_ context.Context, v int) ([]int, error) {
 			out := make([]int, v)
@@ -280,7 +280,7 @@ func multiValueWorkflow(ctx dbos.DBOSContext, n int) ([]int, error) {
 // test. Tests run sequentially, so a plain bool is fine.
 var includeExtraStage = false
 
-func mutableShapeWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
+func mutableShapeWorkflow(ctx dbos.Context, n int) (int, error) {
 	double := duro.Step("double", func(_ context.Context, v int) (int, error) {
 		return v * 2, nil
 	})
@@ -319,7 +319,7 @@ func goroutineShift[T any]() duro.Stage[T, T] {
 	})
 }
 
-func goroutineShiftWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
+func goroutineShiftWorkflow(ctx dbos.Context, n int) (int, error) {
 	return duro.Run(ctx, n, duro.Pipe3(
 		duro.Step("before", func(_ context.Context, v int) (int, error) {
 			return v + 1, nil
@@ -357,7 +357,7 @@ var (
 // fanChildSquare is the child workflow FanOut spawns per item. It tracks how
 // many instances run concurrently so tests can assert the queue's concurrency
 // cap, and sleeps long enough for executions to overlap.
-func fanChildSquare(_ dbos.DBOSContext, n int) (int, error) {
+func fanChildSquare(_ dbos.Context, n int) (int, error) {
 	fanChildRuns.Add(1)
 	active := fanChildActive.Add(1)
 	defer fanChildActive.Add(-1)
@@ -374,7 +374,7 @@ func fanChildSquare(_ dbos.DBOSContext, n int) (int, error) {
 	return n * n, nil
 }
 
-func fanOutWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
+func fanOutWorkflow(ctx dbos.Context, ns []int) (int, error) {
 	return duro.Run(ctx, ns, duro.Pipe3(
 		duro.Expand("explode", func(_ context.Context, xs []int) ([]int, error) {
 			return xs, nil
@@ -386,7 +386,7 @@ func fanOutWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
 	))
 }
 
-func fanOutAllWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func fanOutAllWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	return duro.RunAll(ctx, ns, duro.Pipe2(
 		duro.Expand("explode", func(_ context.Context, xs []int) ([]int, error) {
 			return xs, nil
@@ -429,7 +429,7 @@ func trackedParSquare(_ context.Context, n int) (int, error) {
 	return n * n, nil
 }
 
-func parallelWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
+func parallelWorkflow(ctx dbos.Context, ns []int) (int, error) {
 	return duro.Run(ctx, ns, duro.Pipe3(
 		duro.Expand("explode", func(_ context.Context, xs []int) ([]int, error) {
 			return xs, nil
@@ -441,7 +441,7 @@ func parallelWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
 	))
 }
 
-func parallelAllWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func parallelAllWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	return duro.RunAll(ctx, ns, duro.Pipe2(
 		duro.Expand("explode", func(_ context.Context, xs []int) ([]int, error) {
 			return xs, nil
@@ -452,7 +452,7 @@ func parallelAllWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
 
 const delayDuration = 2 * time.Second
 
-func delayWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
+func delayWorkflow(ctx dbos.Context, n int) (int, error) {
 	return duro.Run(ctx, n, duro.Pipe3(
 		duro.Step("pre", func(_ context.Context, v int) (int, error) {
 			delayPreRuns.Add(1)
@@ -466,7 +466,7 @@ func delayWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
 	))
 }
 
-func recvGreetingWorkflow(ctx dbos.DBOSContext, _ string) (string, error) {
+func recvGreetingWorkflow(ctx dbos.Context, _ string) (string, error) {
 	return duro.Run(ctx, "", duro.Pipe2(
 		duro.Recv[string]("await-note", notesTopic, 10*time.Second),
 		duro.Step("decorate", func(_ context.Context, note string) (string, error) {
@@ -475,7 +475,7 @@ func recvGreetingWorkflow(ctx dbos.DBOSContext, _ string) (string, error) {
 	))
 }
 
-func progressWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
+func progressWorkflow(ctx dbos.Context, ns []int) (int, error) {
 	return duro.Run(ctx, ns, duro.Pipe5(
 		duro.Expand("explode", func(_ context.Context, xs []int) ([]int, error) {
 			return xs, nil
@@ -491,7 +491,7 @@ func progressWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
 
 // senderWorkflow notifies another workflow's mailbox through a duro.Send
 // stage, then returns its input decorated.
-func senderWorkflow(ctx dbos.DBOSContext, destinationID string) (string, error) {
+func senderWorkflow(ctx dbos.Context, destinationID string) (string, error) {
 	return duro.Run(ctx, destinationID, duro.Pipe2(
 		duro.Send("notify", notesTopic, func(dest string) (string, string, error) {
 			return dest, "ping from " + dest, nil
@@ -504,7 +504,7 @@ func senderWorkflow(ctx dbos.DBOSContext, destinationID string) (string, error) 
 
 // pipe7Workflow and pipe8Workflow are smoke coverage for the wide pipe
 // arities: linear int pipelines mixing durable and pure stages.
-func pipe7Workflow(ctx dbos.DBOSContext, n int) (int, error) {
+func pipe7Workflow(ctx dbos.Context, n int) (int, error) {
 	inc := func(_ context.Context, v int) (int, error) { return v + 1, nil }
 	return duro.Run(ctx, n, duro.Pipe7(
 		duro.Step("s1", inc),
@@ -517,7 +517,7 @@ func pipe7Workflow(ctx dbos.DBOSContext, n int) (int, error) {
 	))
 }
 
-func pipe8Workflow(ctx dbos.DBOSContext, n int) (int, error) {
+func pipe8Workflow(ctx dbos.Context, n int) (int, error) {
 	inc := func(_ context.Context, v int) (int, error) { return v + 1, nil }
 	return duro.Run(ctx, n, duro.Pipe8(
 		duro.Step("s1", inc),
@@ -531,7 +531,7 @@ func pipe8Workflow(ctx dbos.DBOSContext, n int) (int, error) {
 	))
 }
 
-func streamingWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
+func streamingWorkflow(ctx dbos.Context, ns []int) (int, error) {
 	return duro.Run(ctx, ns, duro.Pipe3(
 		duro.Expand("explode", func(_ context.Context, xs []int) ([]int, error) {
 			return xs, nil
@@ -805,7 +805,7 @@ func TestGoroutineShiftFailsFast(t *testing.T) {
 }
 
 // TestRunOutsideWorkflowFails proves stages refuse to run when the
-// DBOSContext is not executing a workflow (no checkpointing possible).
+// DBOS Context is not executing a workflow (no checkpointing possible).
 func TestRunOutsideWorkflowFails(t *testing.T) {
 	_, err := duro.Run(dctx, 1, duro.Pipe1(
 		duro.Step("double", func(_ context.Context, v int) (int, error) {

@@ -66,6 +66,38 @@ go get github.com/lemonberrylabs/duro
 
 Requires Go 1.26+ and PostgreSQL (DBOS's system database).
 
+### Upgrading from DBOS v0.18
+
+This release targets `dbos-transact-golang` v1.2.0. DBOS applies its system
+database migrations during `duro.New`/`duro.NewClient`; take the usual database
+backup before the first v1 process connects. The Duro-facing migration points
+are:
+
+- Before deploying v1, stop issuing debounces and let pending v0 debounced
+  workflows fire (or cancel the stragglers). DBOS cannot carry a still-pending
+  v0 debounce across this upgrade.
+- Engine shutdown is now `app.Close(timeout)`. DBOS v1 reserves `Shutdown` for
+  its two-argument interface method and, since v1.1, leaves interrupted runs
+  pending for recovery instead of durably cancelling them.
+- Give enqueue-only clients `ApplicationName: <worker Config.Name>`. A blank
+  name is intentionally an administrative, cross-application client and its
+  enqueues are unclaimed until a queue owner adopts them.
+- DBOS queues are database-backed handles owned by an application. Duro keeps
+  resolving handles inside `FanOut`; for a directly queued `wf.Start`, call
+  `queue.WorkflowOption(app)` and pass the returned option.
+- Cron schedules are applied after `app.Launch`, as v1 requires. Existing
+  schedule names are retained and claimed by the application; new scheduled
+  runs expose their public identity in `RunStatus.ScheduleName` while their
+  internal dispatcher appears in `RunStatus.Name`. Call
+  `duro.ApplySchedules(ctx)` after `dbos.Launch(ctx)` only when using a raw
+  DBOS context instead of `duro.App`.
+- DBOS v1 scopes ordinary listings, stale-run checks, and retention to the
+  configured application plus unclaimed pre-v1 rows. Use a nameless client or
+  `WithApplicationNames` for a deliberate cross-application view.
+- Cancellation watchers now use an application-qualified queue returned by
+  `CancelWatchQueueNameFor(appName)`. Duro also claims the legacy unsuffixed
+  queue where possible so pending v0 watchers can drain.
+
 ## Quickstart
 
 A complete durable application — note the single import:
@@ -116,7 +148,7 @@ func main() {
 	if err := app.Launch(); err != nil {
 		panic(err)
 	}
-	defer app.Shutdown(5 * time.Second)
+	defer app.Close(5 * time.Second)
 
 	handle, err := charge.Start(app, Order{ID: "42", AmountCents: 1999})
 	if err != nil {
@@ -336,6 +368,14 @@ options: `WithConcurrency`, `WithWorkerConcurrency`, `WithRateLimit`,
 `WithPriorities`, `WithPartitions`. Declaring the same queue name twice with
 different configurations fails loudly at registration.
 
+DBOS v1 starts directly queued workflows with a registered queue handle. Duro
+resolves it explicitly when `Start` is used outside `FanOut`:
+
+```go
+queueOpt, err := Jobs.WorkflowOption(app)
+handle, err := processJob.Start(app, input, queueOpt) // processJob is a *PipelineWorkflow
+```
+
 Children are enqueued in stream order with IDs derived from the parent's step
 counter, so a recovered parent re-attaches to its children instead of spawning
 duplicates; results are awaited and emitted in input order, each checkpointed
@@ -472,6 +512,20 @@ recovered by looking it up, so register the same name on every process start.
 registered and warns about each one — a renamed pipeline is a startup warning,
 not a silent recovery failure.
 
+DBOS v1 stores schedules in the database, so Duro applies the declared set
+immediately after `app.Launch()`. A tick is dispatched through an internal
+adapter workflow; `RunStatus.ScheduleName` remains `"nightly-report"` while
+`RunStatus.Name` identifies that internal dispatcher. Registration options,
+including `dbos.WithMaxRecoveryAttempts`, apply to manual starts through the
+returned workflow; scheduled ticks use DBOS's default dispatcher recovery
+budget. Because schedule rows persist, removing `RegisterScheduled` from code
+does not delete the row; explicitly call `dbos.DeleteSchedule` during that
+migration.
+
+If you deliberately build a raw `dbos.Context` instead of using `duro.New`,
+call `duro.ApplySchedules(ctx)` immediately after `dbos.Launch(ctx)`. Duro's
+`App.Launch` already performs that step.
+
 ### Checking on runs
 
 Persist a run's workflow ID and reconcile it later from any process — the
@@ -495,9 +549,11 @@ ids...)` is the batch form; `duro.Attach[R](app, runID)` reconnects a
 restarted process to a live handle so it can await the result, not just
 poll. `Handle.Status()` returns the same `RunStatus`.
 
-`ListRuns` is the fleet-wide view — every run of every registered pipeline,
-from any process attached to the system database — filtered, paged, and
-ordered by options; `Steps` inspects one run's checkpoints:
+`ListRuns` is the application view — runs owned by the App's configured name,
+plus unclaimed rows migrated from pre-v1 DBOS — filtered, paged, and ordered by
+options. A nameless administrative `Client` sees all applications;
+`WithApplicationNames` selects explicit owners. `Steps` inspects one run's
+checkpoints:
 
 ```go
 runs, err := duro.ListRuns(app,
@@ -507,23 +563,26 @@ runs, err := duro.ListRuns(app,
 	duro.WithNewestFirst(), duro.WithLimit(50), duro.WithOffset(page*50))
 
 steps, err := duro.Steps(app, runs[0].ID) // []StepStatus: ID, Name, Err, ChildID, StartedAt, CompletedAt
+
+scheduled, err := duro.ListRuns(app, duro.WithScheduleNames("nightly-report"))
 ```
 
 `RunStatus` carries the cheap per-run columns an admin view needs —
-`QueueName`, `ParentID` (set on FanOut children, so top-level runs are the ones
-without one), `Attempts`, `StartedAt`, `ExecutorID` — plus `Input`, the stored
-input as JSON text, loaded only when `WithInput()` asks for it. Everything else
-stays payload-free, and a failed run's `Err` is filled exactly as `Status` fills
-it. The options refuse to surprise: a membership filter given no values
+`ApplicationName`, `ScheduleName`, `QueueName`, `ParentID` (set on FanOut
+children, so top-level runs are the ones without one), `Attempts`, `StartedAt`,
+`ExecutorID` — plus `Input`, the stored input as JSON text, loaded only when
+`WithInput()` asks for it. Everything else stays payload-free, and a failed
+run's `Err` is filled exactly as `Status` fills it. The options refuse to surprise: a membership filter given no values
 (`WithIDs()`) matches nothing rather than everything, and a non-positive
 `WithLimit` is an error rather than an empty page. `Steps` returns what the run
 has checkpointed — the shape checkpoint (`duro.ShapeStepName`) first, then one
 entry per durable stage execution — which is exactly what replays on recovery.
 duro's own durable plumbing is listed too: every cancel-enabled `FanOut` batch
 runs a watcher workflow named `duro.CancelWatcherName` on the
-`duro.CancelWatchQueueName` queue, so an admin view can show — or filter out —
-those rows by name, and a watcher stuck non-terminal is visible rather than
-hidden.
+application-qualified `duro.CancelWatchQueueNameFor(appName)` queue, so an
+admin view can show — or filter out — those rows by name, and a watcher stuck
+non-terminal is visible rather than hidden. The unsuffixed
+`duro.CancelWatchQueueName` remains the v0 upgrade queue only.
 
 ### Cancelling and resuming
 
@@ -589,9 +648,9 @@ app, err := duro.New(ctx, duro.Config{
 ```
 
 Enable it on **every** worker in the fleet. A killed worker's run resumes on a
-survivor within the stale threshold plus one sweep; a graceful `Shutdown`
-tombstones the lease so undrained runs are taken over on the next sweep with no
-wait. A run taken over goes back on the queue it came from, so it stays subject
+survivor within the stale threshold plus one sweep; a graceful `Close`
+tombstones the lease so interrupted runs are taken over on the next sweep with
+no wait. A run taken over goes back on the queue it came from, so it stays subject
 to that queue's concurrency and rate limits; only a run started directly (which
 has no queue) is re-enqueued on DBOS's internal queue. Takeover guarantees
 exactly-once workflow completion but, like all DBOS recovery, at-least-once step
@@ -602,11 +661,13 @@ a stale threshold under 2× the heartbeat interval, since a threshold that tight
 declares merely-slow workers dead and runs their live work twice. Leave real
 headroom for GC pauses — the defaults are 6×.
 
-`Shutdown`'s timeout bounds the drain; stopping maintenance and writing the
-tombstone are bounded separately and take milliseconds on a healthy database. Do
+`Close`'s timeout bounds DBOS stopping producers and unwinding local workflow
+goroutines; interrupted workflow rows remain pending for recovery. Stopping
+maintenance and writing the tombstone are bounded separately and take
+milliseconds on a healthy database. Do
 not set the timeout to your whole SIGTERM grace period — the tombstone is written
 last, so it is what a `SIGKILL` takes away, and losing it costs the fast adoption
-of exactly the runs that could not drain.
+of exactly the runs that were interrupted.
 
 ### Identity: application version and executor ID
 
@@ -634,7 +695,10 @@ var InvoiceJob = duro.NewJob[Batch, Invoice]("invoice")
 duro.RegisterJob(app, InvoiceJob, invoicePipeline)
 
 // in the web tier
-c, err := duro.NewClient(ctx, duro.ClientConfig{DatabaseURL: url})
+c, err := duro.NewClient(ctx, duro.ClientConfig{
+	DatabaseURL: url,
+	ApplicationName: "orders", // match the workers' Config.Name
+})
 defer c.Shutdown(5 * time.Second)
 
 handle, err := duro.Enqueue(c, Jobs, InvoiceJob, batch)
@@ -642,11 +706,12 @@ status, err := c.Status(handle.ID()) // duro.RunStatus, the same States as duro.
 runs, err := c.ListRuns(duro.WithStates(duro.StateRetriesExceeded)) // the admin view, same options as duro.ListRuns
 ```
 
-A `Client` carries the whole read and remediation surface — `Status`,
+A named `Client` carries the whole read and remediation surface — `Status`,
 `StatusAll`, `ListRuns`, `Steps`, `Cancel`, `Resume` — as thin calls into the
-same core the engine's functions use, so an admin site built on a `Client`
-sees exactly what the workers see and can never disagree with them about a
-run's state.
+same core the engine's functions use. It sees that application's runs plus
+unclaimed migrated rows. Leave `ApplicationName` blank only for a deliberate
+cross-application admin client; ID-addressed operations can also cross
+application boundaries.
 
 Those reads are bounded. DBOS retries a failed database read indefinitely
 until its context ends, which in a request handler means an outage parks a
@@ -655,7 +720,9 @@ read on its own bounded context — `ClientConfig.ReadTimeout`, 30s by default
 — and `WithContext` adds the request's own deadline on top:
 
 ```go
-c, err := duro.NewClient(ctx, duro.ClientConfig{DatabaseURL: url, ReadTimeout: 10 * time.Second})
+c, err := duro.NewClient(ctx, duro.ClientConfig{
+	DatabaseURL: url, ApplicationName: "orders", ReadTimeout: 10 * time.Second,
+})
 
 func list(w http.ResponseWriter, r *http.Request) {
 	runs, err := c.WithContext(r.Context()).ListRuns(duro.WithNewestFirst(), duro.WithLimit(50))
@@ -666,8 +733,8 @@ func list(w http.ResponseWriter, r *http.Request) {
 The bound covers a whole call, however many queries it issues, and the error
 says what ended it: a deadline — `ReadTimeout` or the request's — wraps
 `context.DeadlineExceeded`, a cancelled request wraps `context.Canceled`.
-`Enqueue` and `Handle` waits are not covered — `dbos.Client` offers no context
-for them. On the engine, derive a bounded context with
+`Enqueue` and `Handle` waits are not covered by the per-read bound. On the
+engine, derive a bounded context with
 `dbos.WithTimeout(app.Context(), d)` and pass it to `duro.ListRuns` and friends.
 
 A `Job` is the pipeline's cross-process identity: its registered name and both
@@ -678,8 +745,9 @@ is inserted successfully, reported as a healthy `enqueued`, and waits forever,
 while a mismatched input or result type fails in another process long after the
 call site. With a `Job` all three are compile errors.
 
-Enqueue stamps no application version by default, so any worker version runs the
-job (the web tier need not redeploy in lockstep with the workers); pin one with
+Enqueue stamps no application version by default, so DBOS routes the job to the
+owning application's latest registered version (the web tier need not redeploy
+in lockstep with the workers); pin an exact version with
 `WithClientApplicationVersion`.
 
 `Client` is also how a *worker* hands a whole pipeline to the fleet rather than
@@ -709,10 +777,9 @@ otherwise-unbounded growth of terminal run history, deleting one batch per cycle
 under its own advisory lock — never the sweeper's, so housekeeping can never
 delay a takeover.
 
-Both run on the sweep cadence, and both are **database-wide**: DBOS records no
-application name on a run, so they count and delete every matching run in the
-system database, including other applications' runs if they share it. Give each
-application its own database (or DBOS schema) before enabling retention.
+Both run on the sweep cadence. DBOS v1 scopes them to this application and
+unclaimed rows migrated from pre-v1 releases; rows already owned by another
+application sharing the database are neither counted nor deleted.
 
 ## Built-in safety
 
@@ -800,10 +867,9 @@ whole feature set:
 Experimental. The durability semantics are covered by a test suite that runs
 against a real Postgres — including parity with handwritten DBOS code,
 re-runs with zero re-execution, mid-pipeline fork/replay, and one test per
-safety guard. Both underlying dependencies
-([dbos-transact-golang](https://github.com/dbos-inc/dbos-transact-golang),
-[samber/ro](https://github.com/samber/ro)) are pre-1.0, so expect pinned
-versions and occasional churn until they stabilize.
+safety guard. [DBOS Transact for Go](https://github.com/dbos-inc/dbos-transact-golang)
+is pinned to v1.2.0. [samber/ro](https://github.com/samber/ro) remains pre-1.0,
+so its version is pinned as well.
 
 Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
