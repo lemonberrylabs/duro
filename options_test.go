@@ -23,7 +23,7 @@ var (
 // retryPredicateWorkflow exercises the full retry option set: transient
 // errors retry (with tight, bounded backoff so the test stays fast) while
 // permanent errors stop immediately despite the retry budget.
-func retryPredicateWorkflow(ctx dbos.DBOSContext, mode string) (string, error) {
+func retryPredicateWorkflow(ctx dbos.Context, mode string) (string, error) {
 	return duro.Run(ctx, mode, duro.Pipe1(
 		duro.Step("classify", func(_ context.Context, m string) (string, error) {
 			if m == "permanent" {
@@ -47,7 +47,7 @@ func retryPredicateWorkflow(ctx dbos.DBOSContext, mode string) (string, error) {
 }
 
 // stepTimeoutWorkflow hangs in a stage unless the per-attempt timeout fires.
-func stepTimeoutWorkflow(ctx dbos.DBOSContext, hang bool) (string, error) {
+func stepTimeoutWorkflow(ctx dbos.Context, hang bool) (string, error) {
 	return duro.Run(ctx, hang, duro.Pipe1(
 		duro.Step("maybe-hang", func(stepCtx context.Context, h bool) (string, error) {
 			if !h {
@@ -63,7 +63,7 @@ func stepTimeoutWorkflow(ctx dbos.DBOSContext, hang bool) (string, error) {
 	))
 }
 
-func registerOptionWorkflows(ctx dbos.DBOSContext) {
+func registerOptionWorkflows(ctx dbos.Context) {
 	dbos.RegisterWorkflow(ctx, retryPredicateWorkflow, dbos.WithWorkflowName("retryPredicateWorkflow"))
 	dbos.RegisterWorkflow(ctx, stepTimeoutWorkflow, dbos.WithWorkflowName("stepTimeoutWorkflow"))
 }

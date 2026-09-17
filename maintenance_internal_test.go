@@ -32,7 +32,7 @@ func newMaintenanceApp(t *testing.T, version string) *App {
 	// start the periodic loop). Give the worker pool the maintenance contexts its
 	// methods bound their per-operation timeouts to.
 	a.wp.initMaintContexts()
-	t.Cleanup(func() { a.Shutdown(5 * time.Second) })
+	t.Cleanup(func() { a.Close(5 * time.Second) })
 	return a
 }
 
@@ -73,9 +73,9 @@ func rowExists(t *testing.T, pool *pgxpool.Pool, id string) bool {
 // can recover them, while recent, terminal, and DELAYED runs are ignored — and
 // the hook receives the same counts.
 //
-// Counts are asserted as deltas around the seed. checkStaleRuns aggregates over
-// the whole database (there is no app column to scope by), so any other test's
-// old non-terminal rows would otherwise leak into the totals.
+// Counts are asserted as deltas around the seed. DBOS v1 includes this App's
+// rows plus migrated/unclaimed rows; these synthetic rows deliberately exercise
+// the latter path, so other old unclaimed rows could otherwise affect totals.
 func TestStaleRunWarning(t *testing.T) {
 	const ver = "r4-same-version-unique"
 	app := newMaintenanceApp(t, ver)
@@ -170,7 +170,7 @@ func TestMaintenanceLoopWithoutWorkerPool(t *testing.T) {
 	if err := app.Launch(); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
-	defer app.Shutdown(5 * time.Second)
+	defer app.Close(5 * time.Second)
 
 	// Worker-pool mode is off, so no lease was written — and the table may not
 	// even exist yet (nothing in this app creates it), which is proof in itself.
@@ -215,12 +215,12 @@ func TestMaintenanceLoopWithoutWorkerPool(t *testing.T) {
 // that run through DBOS — retention's list/delete and the stale-run aggregate —
 // hang off the maintenance scope rather than the app's DBOS context.
 //
-// The failure it guards is a Shutdown-latency one, so it is asserted at the
+// The failure it guards is a Close-latency one, so it is asserted at the
 // wiring rather than by hanging a query: if these calls ignore the maintenance
 // scope, a query already in flight runs on to its own 30s opTimeout while
-// Shutdown blocks on maintWG — spending the caller's SIGTERM budget before
-// DBOS's drain has even begun, and typically costing the shutdown tombstone
-// that lets survivors adopt undrained runs without a stale wait.
+// Close blocks on maintWG — spending the caller's SIGTERM budget before DBOS
+// shutdown has even begun, and typically costing the tombstone that lets
+// survivors adopt interrupted runs without a stale wait.
 func TestMaintenanceDBOSCallsObserveStopMaintenance(t *testing.T) {
 	app := newMaintenanceApp(t, "maint-ctx-version")
 
@@ -283,7 +283,7 @@ func TestOptionValidation(t *testing.T) {
 				Logger:      wpLogger(),
 			}, tc.opts...)
 			if err == nil {
-				app.Shutdown(time.Second)
+				app.Close(time.Second)
 				t.Fatalf("New accepted %s, want an error", tc.name)
 			}
 			if !strings.Contains(err.Error(), tc.want) {
@@ -301,7 +301,7 @@ func TestOptionValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New rejected a valid configuration: %v", err)
 	}
-	app.Shutdown(time.Second)
+	app.Close(time.Second)
 }
 
 // TestShutdownIsIdempotent proves a second Shutdown is a no-op rather than
@@ -322,8 +322,8 @@ func TestShutdownIsIdempotent(t *testing.T) {
 	if err := app.Launch(); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
-	app.Shutdown(2 * time.Second)
-	app.Shutdown(2 * time.Second) // must not panic or touch the closed pool
+	app.Close(2 * time.Second)
+	app.Close(2 * time.Second) // must not panic or touch the closed pool
 }
 
 // TestRetention proves R5: terminal runs that completed before the window are

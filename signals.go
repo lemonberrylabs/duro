@@ -219,7 +219,7 @@ func FromStream[T, V any](name string, stream Stream[V], fn func(in T) (workflow
 
 // collectStream drains a durable stream into a slice, honoring the step
 // context's deadline and cancellation.
-func collectStream[V any](stepCtx context.Context, dctx dbos.DBOSContext, workflowID, key string) ([]V, error) {
+func collectStream[V any](stepCtx context.Context, dctx dbos.Context, workflowID, key string) ([]V, error) {
 	ch, err := dbos.ReadStreamAsync[V](dctx, workflowID, key)
 	if err != nil {
 		return nil, err

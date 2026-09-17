@@ -43,7 +43,7 @@ func (c *listConfig) fail(err error) {
 // registered workflow names, as in Register, RegisterJob, or Job.Name. Given
 // no names, nothing matches.
 func WithNames(names ...string) ListOption {
-	return func(c *listConfig) { c.filter(len(names), dbos.WithName(names...)) }
+	return func(c *listConfig) { c.filter(len(names), dbos.WithFilterName(names...)) }
 }
 
 // WithStates restricts the listing to runs in any of the given states. Given
@@ -54,7 +54,7 @@ func WithStates(states ...State) ListOption {
 		for i, s := range states {
 			statuses[i] = dbosStatusOf(s)
 		}
-		c.filter(len(states), dbos.WithStatus(statuses))
+		c.filter(len(states), dbos.WithFilterStatus(statuses...))
 	}
 }
 
@@ -62,19 +62,34 @@ func WithStates(states ...State) ListOption {
 // nothing matches. Unlike StatusAll, results follow the listing's sort order,
 // not the order of the IDs.
 func WithIDs(ids ...string) ListOption {
-	return func(c *listConfig) { c.filter(len(ids), dbos.WithWorkflowIDs(ids)) }
+	return func(c *listConfig) { c.filter(len(ids), dbos.WithFilterWorkflowIDs(ids...)) }
+}
+
+// WithApplicationNames restricts an administrative Client listing to the
+// named DBOS applications. Engine listings are already scoped to their own
+// application (plus unclaimed migrated rows) unless this filter is explicit.
+func WithApplicationNames(names ...string) ListOption {
+	return func(c *listConfig) { c.filter(len(names), dbos.WithFilterApplicationName(names...)) }
+}
+
+// WithScheduleNames restricts the listing to runs created by any of the named
+// database-backed schedules. Given no names, nothing matches. Scheduled Duro
+// pipelines run through an internal adapter, so use this option—not WithNames—
+// to select their public RegisterScheduled names.
+func WithScheduleNames(names ...string) ListOption {
+	return func(c *listConfig) { c.filter(len(names), dbos.WithFilterScheduleName(names...)) }
 }
 
 // WithCreatedAfter restricts the listing to runs created at or after t. A
 // zero time applies no bound.
 func WithCreatedAfter(t time.Time) ListOption {
-	return func(c *listConfig) { c.filters = append(c.filters, dbos.WithStartTime(t)) }
+	return func(c *listConfig) { c.filters = append(c.filters, dbos.WithFilterCreatedAfter(t)) }
 }
 
 // WithCreatedBefore restricts the listing to runs created at or before t. A
 // zero time applies no bound.
 func WithCreatedBefore(t time.Time) ListOption {
-	return func(c *listConfig) { c.filters = append(c.filters, dbos.WithEndTime(t)) }
+	return func(c *listConfig) { c.filters = append(c.filters, dbos.WithFilterCreatedBefore(t)) }
 }
 
 // WithQueue restricts the listing to runs currently recorded on the named
@@ -86,7 +101,7 @@ func WithQueue(name string) ListOption {
 			c.fail(errors.New("duro: ListRuns: WithQueue requires a queue name"))
 			return
 		}
-		c.filters = append(c.filters, dbos.WithQueueName(name))
+		c.filters = append(c.filters, dbos.WithFilterQueueName(name))
 	}
 }
 
@@ -99,7 +114,7 @@ func WithLimit(n int) ListOption {
 			c.fail(fmt.Errorf("duro: ListRuns: WithLimit(%d): limit must be positive", n))
 			return
 		}
-		c.filters = append(c.filters, dbos.WithLimit(n))
+		c.filters = append(c.filters, dbos.WithFilterLimit(n))
 	}
 }
 
@@ -111,14 +126,14 @@ func WithOffset(n int) ListOption {
 			c.fail(fmt.Errorf("duro: ListRuns: WithOffset(%d): offset must not be negative", n))
 			return
 		}
-		c.filters = append(c.filters, dbos.WithOffset(n))
+		c.filters = append(c.filters, dbos.WithFilterOffset(n))
 	}
 }
 
 // WithNewestFirst orders the listing by creation time descending. The
 // default is oldest first.
 func WithNewestFirst() ListOption {
-	return func(c *listConfig) { c.filters = append(c.filters, dbos.WithSortDesc()) }
+	return func(c *listConfig) { c.filters = append(c.filters, dbos.WithFilterSortDesc()) }
 }
 
 // WithInput loads each run's stored input into RunStatus.Input, as JSON
@@ -127,14 +142,15 @@ func WithInput() ListOption {
 	return func(c *listConfig) { c.loadInput = true }
 }
 
-// ListRuns lists durable runs — every registered pipeline and workflow, from
-// any process attached to the system database — filtered, paged, and ordered
-// by the options. With no options it returns every run, oldest first; page
-// with WithLimit and WithOffset. Runs are reported through the same mapping as
-// Status, with the same failed-run treatment: a failed run's recorded error is
-// fetched in a second query scoped to the failed runs on the page, so
-// RunStatus.Err is populated exactly as Status would populate it. No payloads
-// are loaded unless WithInput asks for the input.
+// ListRuns lists durable runs filtered, paged, and ordered by the options. An
+// App sees its own application's runs plus migrated unclaimed rows by default;
+// a nameless Client sees every application, and WithApplicationNames selects
+// explicit owners. With no options the matching runs are returned oldest
+// first; page with WithLimit and WithOffset. Runs are reported through the same
+// mapping as Status, with the same failed-run treatment: a failed run's
+// recorded error is fetched in a second query scoped to the failed runs on the
+// page, so RunStatus.Err is populated exactly as Status would populate it. No
+// payloads are loaded unless WithInput asks for the input.
 //
 //	runs, err := duro.ListRuns(app,
 //		duro.WithNames("invoice"),
@@ -206,9 +222,9 @@ func runSteps(store runStore, workflowID string) ([]StepStatus, error) {
 		// No steps is what both an unknown run and a run that has not started
 		// look like; one extra payload-free query tells them apart.
 		found, err := store.list(
-			dbos.WithWorkflowIDs([]string{workflowID}),
-			dbos.WithLoadInput(false),
-			dbos.WithLoadOutput(false),
+			dbos.WithFilterWorkflowIDs(workflowID),
+			dbos.WithFilterLoadInput(false),
+			dbos.WithFilterLoadOutput(false),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("duro: fetching run status: %w", err)

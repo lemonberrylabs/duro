@@ -26,7 +26,7 @@ func explode(_ context.Context, xs []int) ([]int, error) { return xs, nil }
 // childOptsWorkflow combines the identity and metadata child options in one
 // FanOut: custom child IDs, auth context, an explicit application version,
 // and portable serialization.
-func childOptsWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func childOptsWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	return duro.RunAll(ctx, ns, duro.Pipe2(
 		duro.Expand("explode", explode),
 		duro.FanOut("fan", fanQueue, duro.Workflow(fanChildSquare),
@@ -49,13 +49,13 @@ var dedupChildRuns atomic.Int64
 
 // dedupChild sleeps long enough for its sibling to be enqueued while it is
 // still active, keeping the deduplication window open deterministically.
-func dedupChild(_ dbos.DBOSContext, n int) (int, error) {
+func dedupChild(_ dbos.Context, n int) (int, error) {
 	dedupChildRuns.Add(1)
 	time.Sleep(300 * time.Millisecond)
 	return n * n, nil
 }
 
-func dedupFanOutWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func dedupFanOutWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	return duro.RunAll(ctx, ns, duro.Pipe2(
 		duro.Expand("explode", explode),
 		duro.FanOut("fan", fanQueue, duro.Workflow(dedupChild),
@@ -65,7 +65,7 @@ func dedupFanOutWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
 	))
 }
 
-func priorityFanOutWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func priorityFanOutWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	return duro.RunAll(ctx, ns, duro.Pipe2(
 		duro.Expand("explode", explode),
 		duro.FanOut("fan", priorityQueue, duro.Workflow(fanChildSquare),
@@ -75,7 +75,7 @@ func priorityFanOutWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
 	))
 }
 
-func partitionFanOutWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func partitionFanOutWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	return duro.RunAll(ctx, ns, duro.Pipe2(
 		duro.Expand("explode", explode),
 		duro.FanOut("fan", partitionQueue, duro.Workflow(fanChildSquare),
@@ -87,7 +87,7 @@ func partitionFanOutWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
 
 const childDelayDuration = 1500 * time.Millisecond
 
-func delayFanOutWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func delayFanOutWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	return duro.RunAll(ctx, ns, duro.Pipe2(
 		duro.Expand("explode", explode),
 		duro.FanOut("fan", fanQueue, duro.Workflow(fanChildSquare),
@@ -98,12 +98,12 @@ func delayFanOutWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
 }
 
 // hangingChild blocks until its durable deadline cancels it.
-func hangingChild(ctx dbos.DBOSContext, _ int) (int, error) {
+func hangingChild(ctx dbos.Context, _ int) (int, error) {
 	<-ctx.Done()
 	return 0, ctx.Err()
 }
 
-func timeoutFanOutWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func timeoutFanOutWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	return duro.RunAll(ctx, ns, duro.Pipe2(
 		duro.Expand("explode", explode),
 		duro.FanOut("fan", fanQueue, duro.Workflow(hangingChild),
@@ -139,7 +139,7 @@ var squareChildPipeline = duro.Pipe1(
 	duro.Step("sq", func(_ context.Context, v int) (int, error) { return v * v, nil }),
 )
 
-func registerFanOutOptionWorkflows(ctx dbos.DBOSContext) error {
+func registerFanOutOptionWorkflows(ctx dbos.Context) error {
 	dbos.RegisterWorkflow(ctx, dedupChild, dbos.WithWorkflowName("dedupChild"))
 	dbos.RegisterWorkflow(ctx, hangingChild, dbos.WithWorkflowName("hangingChild"))
 	dbos.RegisterWorkflow(ctx, childOptsWorkflow, dbos.WithWorkflowName("childOptsWorkflow"))
@@ -383,5 +383,22 @@ func TestConflictingQueueDeclarationsFail(t *testing.T) {
 	err := duro.RegisterQueues(app, clash)
 	if err == nil || !strings.Contains(err.Error(), "declared twice") {
 		t.Errorf("error = %v, want the conflicting-declaration error", err)
+	}
+}
+
+func TestZeroQueueFailsClearly(t *testing.T) {
+	var q duro.Queue
+	if _, err := q.WorkflowOption(app); err == nil || !strings.Contains(err.Error(), "NewQueue") {
+		t.Fatalf("zero Queue WorkflowOption error = %v, want a NewQueue diagnostic", err)
+	}
+	if err := duro.RegisterQueues(app, q); err == nil || !strings.Contains(err.Error(), "NewQueue") {
+		t.Fatalf("zero Queue registration error = %v, want a NewQueue diagnostic", err)
+	}
+	valid := duro.NewQueue("nil-context-check")
+	if _, err := valid.WorkflowOption(nil); err == nil || !strings.Contains(err.Error(), "non-nil context") {
+		t.Fatalf("nil-context WorkflowOption error = %v, want a context diagnostic", err)
+	}
+	if err := duro.RegisterQueues(nil, valid); err == nil || !strings.Contains(err.Error(), "non-nil context") {
+		t.Fatalf("nil-context registration error = %v, want a context diagnostic", err)
 	}
 }

@@ -30,7 +30,7 @@ var (
 var scheduledPipeline = duro.Pipe1(
 	duro.Step("tick", func(stepCtx context.Context, ts time.Time) (string, error) {
 		cronTicks.Add(1)
-		if dctx, ok := stepCtx.(dbos.DBOSContext); ok {
+		if dctx, ok := stepCtx.(dbos.Context); ok {
 			if id, err := dbos.GetWorkflowID(dctx); err == nil {
 				cronLastID.Store(id)
 			}
@@ -73,7 +73,7 @@ var (
 	fanIntoFnWf   *duro.PipelineWorkflow[[][]int, []int]
 )
 
-func registerPipelineWorkflows(ctx dbos.DBOSContext) {
+func registerPipelineWorkflows(ctx dbos.Context) {
 	registeredWf = duro.Register(ctx, "registeredPipeline", registeredPipeline)
 	duro.RegisterScheduled(ctx, "cronPipeline", "* * * * * *", scheduledPipeline) // every second
 	debouncer = duro.RegisterDebounced(ctx, "debouncedPipeline", debouncedPipeline)
@@ -123,6 +123,11 @@ func TestRegisterPipelineAsWorkflow(t *testing.T) {
 // cron schedule as durable workflows: a tick fires within a few seconds and
 // its run checkpoints the stages like any other pipeline.
 func TestScheduledPipeline(t *testing.T) {
+	// Public and idempotent for hand-built DBOS contexts; App.Launch already
+	// called it for the normal Duro lifecycle.
+	if err := duro.ApplySchedules(dctx); err != nil {
+		t.Fatalf("re-applying declared schedules: %v", err)
+	}
 	deadline := time.Now().Add(15 * time.Second)
 	for cronTicks.Load() == 0 {
 		if time.Now().After(deadline) {
@@ -142,7 +147,57 @@ func TestScheduledPipeline(t *testing.T) {
 	if _, err := handle.GetResult(); err != nil {
 		t.Fatalf("scheduled run failed: %v", err)
 	}
+	status, err := duro.Status(app, id)
+	if err != nil {
+		t.Fatalf("scheduled status: %v", err)
+	}
+	if status.ScheduleName != "cronPipeline" || status.ApplicationName != "duro-test" {
+		t.Errorf("scheduled identity = schedule %q application %q, want cronPipeline/duro-test", status.ScheduleName, status.ApplicationName)
+	}
+	if status.Name != "duro.scheduled-pipeline" {
+		t.Errorf("scheduled workflow name = %q, want shared dispatcher identity", status.Name)
+	}
+	listed, err := duro.ListRuns(app, duro.WithScheduleNames("cronPipeline"), duro.WithIDs(id))
+	if err != nil {
+		t.Fatalf("listing scheduled run: %v", err)
+	}
+	if len(listed) != 1 || listed[0].ID != id {
+		t.Errorf("scheduled listing = %+v, want run %s", listed, id)
+	}
 	assertNames(t, stepNames(t, id), []string{duro.ShapeStepName, "tick"})
+}
+
+// TestScheduleRegisteredThroughDerivedContext proves Duro keys its declaration
+// ledger by App identity rather than one concrete DBOS context clone. This is
+// easy to break in v1 because registration and App.Launch see different
+// context values even though DBOS shares their workflow registry.
+func TestScheduleRegisteredThroughDerivedContext(t *testing.T) {
+	a, err := duro.New(context.Background(), duro.Config{
+		Name:        "duro-derived-schedule",
+		DatabaseURL: testDatabaseURL(),
+		Logger:      quietLogger(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	derived := dbos.WithValue(a.Context(), struct{}{}, "derived")
+	duro.RegisterScheduled(derived, "derived-context-schedule", "0 0 0 1 1 *", duro.Pipe1(
+		duro.Step("derived-tick", func(_ context.Context, _ time.Time) (string, error) {
+			return "derived-ran", nil
+		}),
+	))
+	if err := a.Launch(); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	defer a.Close(5 * time.Second)
+
+	h, err := dbos.TriggerSchedule[string](a.Context(), "derived-context-schedule")
+	if err != nil {
+		t.Fatalf("TriggerSchedule: %v", err)
+	}
+	if got, err := h.GetResult(); err != nil || got != "derived-ran" {
+		t.Fatalf("scheduled result = %q, %v; want derived-ran", got, err)
+	}
 }
 
 // TestDebouncedPipeline proves RegisterDebounced collapses a burst of

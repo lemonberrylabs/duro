@@ -9,7 +9,7 @@ import (
 // OrderWorkflow is the plain DBOS variant: the same four step functions wired
 // with sequential dbos.RunAsStep calls. It is the baseline the ro variant is
 // compared against.
-func OrderWorkflow(ctx dbos.DBOSContext, o Order) (Confirmation, error) {
+func OrderWorkflow(ctx dbos.Context, o Order) (Confirmation, error) {
 	v, err := dbos.RunAsStep(ctx, func(sc context.Context) (ValidatedOrder, error) {
 		return validateOrder(sc, o)
 	}, dbos.WithStepName("validate"))

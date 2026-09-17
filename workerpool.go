@@ -46,7 +46,7 @@ const (
 
 	// tombstoneTimeout bounds the shutdown tombstone, and is deliberately far
 	// tighter than opTimeout. The tombstone is the one operation that runs after
-	// DBOS's drain, past the point App.Shutdown's timeout covers, so every second
+	// DBOS shutdown, past the point App.Close's timeout covers, so every second
 	// it takes overruns the process's SIGTERM budget. It is a single-row
 	// primary-key UPDATE: if it cannot land in this long the database is
 	// unhealthy, and waiting longer buys nothing the stale-threshold fallback
@@ -205,9 +205,9 @@ func WithSweepInterval(d time.Duration) Option {
 // Delay reports healthy runs as stale. (Debounced runs, which park in DELAYED,
 // are already excluded.)
 //
-// Scope warning: DBOS records no application name on a run, so the counts cover
-// every run in the system database, including those of other applications
-// sharing it.
+// DBOS v1 scopes the counts to this application and any unclaimed rows left by
+// pre-v1 migrations. Runs owned by other applications in the same database are
+// not included.
 func WithStaleRunWarning(age time.Duration, hook ...func(StaleRunInfo)) Option {
 	return func(o *appOptions) {
 		o.staleRunWarn, o.staleRunWarnSet = age, true
@@ -224,10 +224,9 @@ func WithStaleRunWarning(age time.Duration, hook ...func(StaleRunInfo)) Option {
 // transaction; deletion holds its own advisory lock, never the sweeper's, so
 // retention can never delay a takeover. Usable with or without WithWorkerPool.
 //
-// Scope warning: DBOS records no application name on a run, so retention deletes
-// every terminal run in the system database older than d — including runs
-// belonging to other duro or DBOS applications that share it. Give each
-// application its own database (or DBOS schema) before enabling this.
+// DBOS v1 scopes retention to this application and any unclaimed rows left by
+// pre-v1 migrations. It does not delete runs owned by other applications that
+// share the database.
 func WithRetention(d time.Duration) Option {
 	return func(o *appOptions) { o.retention, o.retentionSet = d, true }
 }
@@ -238,7 +237,7 @@ func WithRetention(d time.Duration) Option {
 type workerPool struct {
 	pool       *pgxpool.Pool
 	logger     *slog.Logger
-	dctx       dbos.DBOSContext
+	dctx       dbos.Context
 	appName    string
 	executorID string
 	version    string
@@ -261,32 +260,32 @@ type workerPool struct {
 
 	// beat* controls the heartbeat goroutine; maint* controls the sweeper,
 	// retention, and stale-run-warning goroutines. They are separate so
-	// Shutdown can stop maintenance first yet keep heartbeating through DBOS's
-	// drain (so this node's still-executing runs stay fresh and un-takeable).
+	// Close can stop maintenance first yet keep heartbeating while DBOS unwinds
+	// (so this node's still-executing runs stay fresh and un-takeable).
 	//
 	// maintDctx is the DBOS-side half of maintCtx. The maintenance duties that
 	// go through DBOS (retention's list and delete, the stale-run aggregate)
-	// need a DBOSContext, and one derived from the app's would not observe
+	// need a DBOS Context, and one derived from the app's would not observe
 	// maintCancel at all — a query already in flight would then run to its own
-	// opTimeout while Shutdown waited on maintWG, burning the caller's SIGTERM
-	// budget before DBOS's drain even started. stopMaintenance cancels both.
+	// opTimeout while Close waited on maintWG, burning the caller's SIGTERM
+	// budget before DBOS shutdown even started. stopMaintenance cancels both.
 	beatCtx         context.Context
 	beatCancel      context.CancelFunc
 	beatWG          sync.WaitGroup
 	maintCtx        context.Context
 	maintCancel     context.CancelFunc
-	maintDctx       dbos.DBOSContext
+	maintDctx       dbos.Context
 	maintDctxCancel context.CancelFunc
 	maintWG         sync.WaitGroup
 
-	// closeOnce keeps a second Shutdown from tombstoning against a closed pool.
+	// closeOnce keeps a second Close from tombstoning against a closed pool.
 	closeOnce sync.Once
 }
 
 // newWorkerPool opens duro's dedicated pool and ensures the heartbeat table.
 // It reads the *resolved* executor ID and application version off the DBOS
 // context, so env-var overrides and DBOS's defaults are already applied.
-func newWorkerPool(ctx context.Context, cfg Config, dctx dbos.DBOSContext, o appOptions, logger *slog.Logger) (*workerPool, error) {
+func newWorkerPool(ctx context.Context, cfg Config, dctx dbos.Context, o appOptions, logger *slog.Logger) (*workerPool, error) {
 	pcfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("duro: worker-pool: parsing database URL: %w", err)
@@ -330,7 +329,7 @@ func newWorkerPool(ctx context.Context, cfg Config, dctx dbos.DBOSContext, o app
 }
 
 // ensureTable creates the heartbeat table if it does not exist. The dbos schema
-// already exists here — DBOS runs its migrations during NewDBOSContext, before
+// already exists here — DBOS runs its migrations during NewContext, before
 // duro's New returns.
 func (w *workerPool) ensureTable(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, opTimeout)
@@ -402,7 +401,7 @@ func (w *workerPool) beat(ctx context.Context) error {
 }
 
 // tombstone marks this executor's lease as long-dead (last_heartbeat at the
-// epoch), so a graceful shutdown's undrained runs are eligible for takeover on
+// epoch), so a graceful shutdown's interrupted runs are eligible for takeover on
 // the next survivor sweep with no stale wait. An absent row means "unknown —
 // do not touch"; a tombstoned row means "known-dead — take over now".
 //
@@ -486,7 +485,7 @@ func (w *workerPool) startMaintenance() {
 }
 
 // maintenanceLoop runs the periodic worker-pool duties at the sweep cadence
-// until maintCtx is cancelled (which Shutdown does before DBOS drains).
+// until maintCtx is cancelled (which Close does before DBOS shutdown).
 func (w *workerPool) maintenanceLoop() {
 	defer w.maintWG.Done()
 	t := time.NewTicker(w.sweepInterval)
@@ -577,13 +576,16 @@ func (w *workerPool) sweepOnce(ctx context.Context) (int, error) {
 
 // takeoverSQL re-enqueues the PENDING runs of dead executors on this app's
 // application version. It mirrors DBOS's own resume (system_database.go
-// resumeWorkflows) — largely the same column writes — but adds the executor_id
-// and application_version predicates that make it safe:
+// resumeWorkflows) — largely the same column writes — but adds the executor_id,
+// application_version and application_name predicates that make it safe:
 //
 //   - The ownership check runs atomically under the rows' locks, so a run a live
 //     executor has already re-claimed (its executor_id no longer among the dead
 //     set) is never yanked back to ENQUEUED — closing the list-then-resume race
 //     that raw dbos.ResumeWorkflows would open.
+//   - Application ownership is equally atomic. V1-owned rows must match this
+//     app; migrated v0 rows are unclaimed (NULL), so takeover claims them for
+//     the dead executor's known app before they return to a shared queue.
 //   - Gating on liveness (heartbeat staleness), not dequeue time, covers
 //     directly-started pipelines, whose started_at_epoch_ms is NULL.
 //
@@ -599,10 +601,9 @@ func (w *workerPool) sweepOnce(ctx context.Context) (int, error) {
 // have none (a directly-started pipeline has no queue to return to, and
 // nothing but a queue runner can restart it from here).
 //
-// NULLIF is load-bearing: DBOS writes the empty string, not NULL, as the queue
-// of a directly started run, so a plain COALESCE would leave those runs
-// ENQUEUED under an empty queue name, which no queue runner polls. They would
-// be stranded permanently, by the very sweep meant to rescue them.
+// NULLIF keeps compatibility with v0 rows, where DBOS wrote the empty string
+// for a directly started run. V1 writes NULL. COALESCE handles both and avoids
+// an empty queue name that no runner polls.
 //
 // Preserving the queue does assume some live executor on this application
 // version polls it. That holds by construction for pipelines: Register
@@ -624,9 +625,11 @@ func (w *workerPool) sweepOnce(ctx context.Context) (int, error) {
 const takeoverSQL = `UPDATE dbos.workflow_status
 	SET status = $1, queue_name = COALESCE(NULLIF(queue_name, ''), $2),
 	    workflow_deadline_epoch_ms = NULL, deduplication_id = NULL,
-	    started_at_epoch_ms = NULL, updated_at = $3, completed_at = NULL
+	    started_at_epoch_ms = NULL, updated_at = $3, completed_at = NULL,
+	    application_name = COALESCE(application_name, $6)
 	WHERE status = $4
 	  AND application_version = $5
+	  AND (application_name = $6 OR application_name IS NULL)
 	  AND executor_id IN (
 	      SELECT executor_id FROM ` + heartbeatTable + `
 	       WHERE app_name = $6 AND last_heartbeat < now() - make_interval(secs => $7)
@@ -686,10 +689,11 @@ const pruneLeasesSQL = `DELETE FROM ` + heartbeatTable + ` h
 	WHERE h.app_name = $1
 	  AND h.last_heartbeat < now() - make_interval(secs => $2)
 	  AND NOT EXISTS (
-	      SELECT 1 FROM dbos.workflow_status ws
-	       WHERE ws.executor_id = h.executor_id
-	         AND ws.status = $3
-	  )`
+		      SELECT 1 FROM dbos.workflow_status ws
+		       WHERE ws.executor_id = h.executor_id
+		         AND ws.status = $3
+		         AND (ws.application_name = h.app_name OR ws.application_name IS NULL)
+		  )`
 
 // pruneLeases removes long-dead leases; see pruneLeasesSQL.
 func (w *workerPool) pruneLeases(ctx context.Context) (int64, error) {
@@ -819,16 +823,16 @@ func (w *workerPool) sweepRetention() (int, error) {
 		defer dcancel()
 
 		terminal, err := dbos.ListWorkflows(dctx,
-			dbos.WithStatus([]dbos.WorkflowStatusType{
+			dbos.WithFilterStatus([]dbos.WorkflowStatusType{
 				dbos.WorkflowStatusSuccess,
 				dbos.WorkflowStatusError,
 				dbos.WorkflowStatusCancelled,
 				dbos.WorkflowStatusMaxRecoveryAttemptsExceeded,
-			}),
-			dbos.WithCompletedBefore(time.Now().Add(-w.retention)),
-			dbos.WithLoadInput(false),
-			dbos.WithLoadOutput(false),
-			dbos.WithLimit(retentionBatchSize),
+			}...),
+			dbos.WithFilterCompletedBefore(time.Now().Add(-w.retention)),
+			dbos.WithFilterLoadInput(false),
+			dbos.WithFilterLoadOutput(false),
+			dbos.WithFilterLimit(retentionBatchSize),
 		)
 		if err != nil {
 			return fmt.Errorf("duro: worker-pool: listing expired runs: %w", err)
@@ -850,10 +854,10 @@ func (w *workerPool) sweepRetention() (int, error) {
 }
 
 // stopMaintenance stops the sweeper and other maintenance goroutines, leaving
-// the heartbeat running (Shutdown keeps beating through DBOS's drain).
+// the heartbeat running (Close keeps beating while DBOS unwinds).
 //
 // It cancels both halves of the maintenance scope, so a database call already
-// in flight is aborted rather than waited out: Shutdown returns to draining
+// in flight is aborted rather than waited out: Close proceeds to DBOS shutdown
 // promptly instead of holding for an operation timeout first.
 func (w *workerPool) stopMaintenance() {
 	if w.maintCancel != nil {

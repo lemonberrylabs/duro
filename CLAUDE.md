@@ -7,8 +7,8 @@
 Every stage executes inside `dbos.RunAsStep` and checkpoints to Postgres; a
 crashed process resumes mid-pipeline, replaying completed stages from their
 checkpoints instead of re-running them. [samber/ro](https://github.com/samber/ro)
-is the reactive engine underneath; DBOS provides the durability. Both deps are
-pre-1.0 and pinned — keep dependencies to those two, plus `jackc/pgx/v5`,
+is the reactive engine underneath; DBOS provides the durability. DBOS is pinned
+to v1.2.0 and ro remains pre-1.0 — keep dependencies to those two, plus `jackc/pgx/v5`,
 used **only** where duro runs its own SQL or owns a pool: worker-pool mode
 (`workerpool.go`), the `Client`'s pool (`client.go`), and the `App`'s admin pool
 for `Resume` (`app.go`) — a Postgres handle DBOS does not expose (pgx is already
@@ -80,14 +80,15 @@ Single flat package at the repo root:
 - `channels.go`, `signals.go` — typed `Topic`/`Event`/`Stream`; `Delay`/`Send`/
   `Recv`/`SetEvent`/`GetEvent`/`ToStream`/`FromStream`
 - `app.go` — `App`, `Config` (incl. `ApplicationVersion`/`ExecutorID`),
-  `New`/`Launch`/`Shutdown`, stranded-run warning
-- `register.go` — `Register`/`RegisterScheduled`/`RegisterDebounced`/
+  `New`/`Launch`/`Close`, stranded-run warning
+- `register.go` — `Register`/`RegisterScheduled`/`ApplySchedules`/`RegisterDebounced`/
   `RegisterWorkflow`/`RegisterQueues`
 - `handle.go`, `status.go`, `fork.go` — `Handle`, `Status`/`StatusAll`/`Attach`,
   `ForkFromStage`; `status.go` holds `runStore` (the DBOS operations the
   read/remediation APIs need, adapted from either an engine context or a
   `dbos.Client`) and the shared `listRuns`/`statusAll` mapping cores
 - `list.go` — `ListRuns` + `ListOption`s (`WithNames`/`WithStates`/`WithIDs`/
+  `WithApplicationNames`/`WithScheduleNames`/
   `WithCreatedAfter`/`WithCreatedBefore`/`WithQueue`/`WithLimit`/`WithOffset`/
   `WithNewestFirst`/`WithInput`), `Steps`/`StepStatus`
 - `control.go` — `Cancel`, `App.Resume`, `ErrRunTerminal`/`ErrRunActive`/
@@ -159,8 +160,8 @@ Single flat package at the repo root:
 - Every maintenance database call must hang off the maintenance scope: pgx ones
   off `maintCtx`, DBOS-routed ones off `maintDctx` (`initMaintContexts`). One
   built from the app's DBOS context compiles and works, but ignores
-  `stopMaintenance` — so `Shutdown` blocks on `maintWG` for a full `opTimeout`
-  before the drain starts, usually costing the tombstone. Pinned by
+  `stopMaintenance` — so `Close` blocks on `maintWG` for a full `opTimeout`
+  before DBOS shutdown starts, usually costing the tombstone. Pinned by
   `TestMaintenanceDBOSCallsObserveStopMaintenance`.
 - An **absent** heartbeat row means "unknown executor, do not touch its runs";
   a **tombstoned** one (epoch timestamp) means "known-dead, adopt now". Lease
@@ -199,9 +200,11 @@ Single flat package at the repo root:
   dev runs the engine. Pass both flags explicitly on every `ListWorkflows`
   call; pinned by `TestClientFailedRunExposesError`.
 - **Client reads must go through `readContext`, once per public call**, never
-  `c.c.ListWorkflows` and friends on the `dbos.Client`: that interface exposes
-  no context, and DBOS retries every failed read forever (`maxRetries: -1`,
-  backoff to 30s) until its context ends — a read on it hangs an api-tier
+  `c.c.ListWorkflows` and friends on the root `dbos.Client`: although the v1
+  interface embeds `context.Context`, it does not expose the DBOS context-
+  derivation methods needed to retain client capabilities with a tighter
+  deadline. DBOS retries every failed read forever (`maxRetries: -1`, backoff
+  to 30s) until its context ends — a read on the root hangs an api-tier
   goroutine for the length of a database outage. One context per call, not
   per query, or a two-query call takes two timeouts. `readContext` takes the
   sooner of `ReadTimeout` and the caller's deadline and only propagates the

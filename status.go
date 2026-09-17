@@ -52,6 +52,7 @@ type RunStatus struct {
 	// for those — and while a queued run is still enqueued or delayed.
 	StartedAt          time.Time
 	CompletedAt        time.Time // zero until terminal
+	ApplicationName    string    // owning DBOS application; empty while unclaimed
 	ApplicationVersion string
 	ExecutorID         string // the executor that last ran (or is running) it
 	// Attempts counts how many times execution has been started — 1 for a run
@@ -66,6 +67,9 @@ type RunStatus struct {
 	// other child workflows, "" for top-level runs.
 	ParentID   string
 	ForkedFrom string // original run's ID when this run was forked
+	// ScheduleName identifies the database-backed schedule that created this
+	// run. It is empty for manually started and client-enqueued workflows.
+	ScheduleName string
 	// Input is the run's input as JSON text — json.RawMessage(status.Input)
 	// re-emits it. It is empty unless the run was listed with WithInput:
 	// loading payloads is what the status path otherwise avoids. It is the
@@ -160,7 +164,7 @@ func statusAll(store runStore, workflowIDs []string) ([]RunStatus, error) {
 	if len(workflowIDs) == 0 {
 		return nil, nil
 	}
-	found, err := listRuns(store, false, dbos.WithWorkflowIDs(workflowIDs))
+	found, err := listRuns(store, false, dbos.WithFilterWorkflowIDs(workflowIDs...))
 	if err != nil {
 		return nil, err
 	}
@@ -188,7 +192,7 @@ func statusAll(store runStore, workflowIDs []string) ([]RunStatus, error) {
 func listRuns(store runStore, loadInput bool, filters ...dbos.ListWorkflowsOption) ([]RunStatus, error) {
 	opts := make([]dbos.ListWorkflowsOption, 0, len(filters)+2)
 	opts = append(opts, filters...)
-	opts = append(opts, dbos.WithLoadInput(loadInput), dbos.WithLoadOutput(false))
+	opts = append(opts, dbos.WithFilterLoadInput(loadInput), dbos.WithFilterLoadOutput(false))
 	found, err := store.list(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("duro: fetching run status: %w", err)
@@ -219,9 +223,9 @@ func listRuns(store runStore, loadInput bool, filters ...dbos.ListWorkflowsOptio
 		// implicit, an api tier would report every failure as the placeholder
 		// while the workers see the real message.
 		failed, err := store.list(
-			dbos.WithWorkflowIDs(failedIDs),
-			dbos.WithLoadInput(false),
-			dbos.WithLoadOutput(true),
+			dbos.WithFilterWorkflowIDs(failedIDs...),
+			dbos.WithFilterLoadInput(false),
+			dbos.WithFilterLoadOutput(true),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("duro: fetching failure reasons: %w", err)
@@ -283,7 +287,7 @@ func Attach[R any](ctx Context, workflowID string) (Handle[R], error) {
 // notFoundOr maps DBOS's unknown-workflow error onto ErrRunNotFound and
 // passes every other error through unchanged.
 func notFoundOr(err error, workflowID string) error {
-	if errors.Is(err, &dbos.DBOSError{Code: dbos.NonExistentWorkflowError}) {
+	if errors.Is(err, dbos.ErrNonExistentWorkflow) {
 		return fmt.Errorf("%w: %s", ErrRunNotFound, workflowID)
 	}
 	return err
@@ -306,12 +310,14 @@ func runStatusOf(s dbos.WorkflowStatus) RunStatus {
 		UpdatedAt:          s.UpdatedAt,
 		StartedAt:          s.StartedAt,
 		CompletedAt:        s.CompletedAt,
+		ApplicationName:    s.ApplicationName,
 		ApplicationVersion: s.ApplicationVersion,
 		ExecutorID:         s.ExecutorID,
 		Attempts:           s.Attempts,
 		QueueName:          s.QueueName,
 		ParentID:           s.ParentWorkflowID,
 		ForkedFrom:         s.ForkedFrom,
+		ScheduleName:       s.ScheduleName,
 	}
 }
 

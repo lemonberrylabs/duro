@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dbos-inc/dbos-transact-golang/dbos"
@@ -40,12 +41,48 @@ type Config struct {
 	ExecutorID string
 }
 
+// applicationRuntime is the in-process identity of one App. It distinguishes
+// Apps with the same durable application name against different databases
+// when resolving DBOS v1's database-backed queue handles and Duro registries.
+type applicationRuntime struct{ name string }
+
+// applicationRuntimeContextKey carries that identity into workflow contexts
+// without deriving the DBOS root. DBOS v1 deliberately strips root lifecycle
+// state from derived contexts, so this value must be installed on the standard
+// parent before NewContext.
+type applicationRuntimeContextKey struct{}
+
+func applicationRuntimeFromContext(ctx Context) *applicationRuntime {
+	if ctx == nil {
+		return nil
+	}
+	runtime, _ := ctx.Value(applicationRuntimeContextKey{}).(*applicationRuntime)
+	return runtime
+}
+
+func applicationNameFromContext(ctx Context) string {
+	if runtime := applicationRuntimeFromContext(ctx); runtime != nil {
+		return runtime.name
+	}
+	return ""
+}
+
+// applicationRegistryKey gives every context derived from one Duro App the
+// same registry identity. Raw DBOS contexts fall back to their concrete
+// context identity because they do not carry Duro's runtime value.
+func applicationRegistryKey(ctx Context) any {
+	if runtime := applicationRuntimeFromContext(ctx); runtime != nil {
+		return runtime
+	}
+	return ctx
+}
+
 // App owns the DBOS lifecycle so applications never touch it directly:
 //
 //	app, err := duro.New(ctx, duro.Config{Name: "orders", DatabaseURL: url})
 //	wf := duro.Register(app, "invoice", invoicePipeline) // register everything...
 //	err = app.Launch()                                   // ...then launch
-//	defer app.Shutdown(5 * time.Second)
+//	defer app.Close(5 * time.Second)
 //	handle, err := wf.Start(app, batch)
 //
 // Launch also checks for stranded runs: in-flight workflows recorded under
@@ -56,9 +93,14 @@ type Config struct {
 // Calling raw dbos package functions directly is different: several inspect
 // the concrete context type, so hand them Context() rather than the App
 // itself.
+type embeddedDBOSContext = dbos.Context
+
 type App struct {
-	dbos.DBOSContext
-	logger *slog.Logger
+	embeddedDBOSContext
+	// DBOSContext retains the v0 embedded field name for callers that accessed
+	// it explicitly. New code should use Context().
+	DBOSContext dbos.Context
+	logger      *slog.Logger
 	// wp holds the worker-pool liveness machinery; nil unless WithWorkerPool
 	// (or WithRetention / WithStaleRunWarning) is passed to New.
 	wp *workerPool
@@ -70,6 +112,8 @@ type App struct {
 	adminOnce   sync.Once
 	admin       *pgxpool.Pool
 	adminErr    error
+
+	launchStarted atomic.Bool
 }
 
 // New initializes the application. Register pipelines and queues after New
@@ -103,7 +147,8 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*App, error) {
 	if o.workerPool && cfg.ExecutorID == "" && os.Getenv("DBOS__VMID") == "" {
 		cfg.ExecutorID = generateExecutorID()
 	}
-	dctx, err := dbos.NewDBOSContext(ctx, dbos.Config{
+	ctx = context.WithValue(ctx, applicationRuntimeContextKey{}, &applicationRuntime{name: cfg.Name})
+	dctx, err := dbos.NewContext(ctx, dbos.Config{
 		AppName:            cfg.Name,
 		DatabaseURL:        cfg.DatabaseURL,
 		Logger:             logger,
@@ -116,17 +161,17 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*App, error) {
 	// Every app carries duro's cancellation watcher (see WithCancelSiblings):
 	// watchers are queued workflows, and any executor may dequeue or recover
 	// one, so the registration must exist on every process.
-	if err := registerCancelWatcher(dctx); err != nil {
-		dctx.Shutdown(5 * time.Second)
+	if err := registerCancelWatcher(dctx, cfg.Name); err != nil {
+		_ = dbos.Shutdown(dctx, 5*time.Second)
 		return nil, err
 	}
-	app := &App{DBOSContext: dctx, logger: logger, databaseURL: cfg.DatabaseURL}
+	app := &App{embeddedDBOSContext: dctx, DBOSContext: dctx, logger: logger, databaseURL: cfg.DatabaseURL}
 	// The worker-pool machinery (dedicated pool, heartbeat table) is also what
 	// retention and stale-run warning run on, so open it for any of the three.
 	if o.workerPool || o.retention > 0 || o.staleRunWarn > 0 {
 		wp, err := newWorkerPool(ctx, cfg, dctx, o, logger)
 		if err != nil {
-			dctx.Shutdown(5 * time.Second)
+			_ = dbos.Shutdown(dctx, 5*time.Second)
 			return nil, err
 		}
 		app.wp = wp
@@ -177,13 +222,24 @@ func poolExec(pool *pgxpool.Pool) execFunc {
 // starting queue runners (an executor must never be dequeuing while observably
 // dead), then starts the heartbeat and sweeper goroutines.
 func (a *App) Launch() error {
+	if !a.launchStarted.CompareAndSwap(false, true) {
+		return errors.New("duro: App.Launch may only be called once")
+	}
 	if a.wp != nil && a.wp.enabled {
 		if err := a.wp.firstBeat(context.Background()); err != nil {
+			a.launchStarted.Store(false) // DBOS has not started; a transient beat may be retried.
 			return err
 		}
 	}
 	if err := dbos.Launch(a.DBOSContext); err != nil {
+		// DBOS v1 launch failures are terminal and already shut down its own
+		// context. Close Duro's pools and tombstone any first heartbeat too.
+		_ = a.Close(5 * time.Second)
 		return err
+	}
+	if err := ApplySchedules(a.DBOSContext); err != nil {
+		_ = a.Close(5 * time.Second)
+		return fmt.Errorf("duro: applying schedules after launch: %w", err)
 	}
 	if a.wp != nil {
 		a.wp.start()
@@ -192,28 +248,31 @@ func (a *App) Launch() error {
 	return nil
 }
 
-// Shutdown stops DBOS, waiting up to timeout for in-flight work to settle.
+// Close stops DBOS, waiting up to timeout for local workflow execution to
+// unwind. Interrupted workflows remain PENDING for recovery; Close does not
+// durably cancel them.
 //
 // In worker-pool mode the ordering matters: the sweeper stops first, the
-// heartbeat keeps beating through DBOS's drain (so runs still executing here
-// stay fresh and un-takeable however long the drain runs), and only once DBOS
-// has stopped is the lease tombstoned — so any runs that could not drain are
-// adopted by a survivor on its next sweep with no stale wait. Follow Shutdown
+// heartbeat keeps beating while DBOS unwinds (so runs still executing here
+// stay fresh and un-takeable however long that takes), and only once DBOS has
+// stopped is the lease tombstoned — so interrupted runs are
+// adopted by a survivor on its next sweep with no stale wait. Follow Close
 // promptly with process exit.
 //
-// timeout bounds the drain. The two steps around it are bounded separately and
+// timeout bounds DBOS shutdown. The two steps around it are bounded separately and
 // take milliseconds against a healthy database: stopping maintenance cancels
 // whatever query it has in flight rather than waiting it out, and the tombstone
 // is a single primary-key UPDATE bounded by a few seconds of its own. Budget
 // timeout plus a small constant for the whole call — never let timeout consume
 // the entire SIGTERM grace period, or the tombstone is the part that is lost.
 //
-// Calling Shutdown more than once is safe; the extra calls do nothing.
-func (a *App) Shutdown(timeout time.Duration) {
+// Calling Close more than once is safe; the extra calls do nothing. It returns
+// an error if DBOS could not stop every resource before timeout.
+func (a *App) Close(timeout time.Duration) error {
 	if a.wp != nil {
 		a.wp.stopMaintenance()
 	}
-	dbos.Shutdown(a.DBOSContext, timeout)
+	shutdownErr := dbos.Shutdown(a.DBOSContext, timeout)
 	// Refuse to open the admin pool from here on, and close it if it exists.
 	a.adminOnce.Do(func() { a.adminErr = errors.New("duro: app is shut down") })
 	if a.admin != nil {
@@ -230,26 +289,28 @@ func (a *App) Shutdown(timeout time.Duration) {
 			a.wp.close()
 		})
 	}
+	return shutdownErr
 }
+
+// Shutdown implements dbos.Context's v1 lifecycle method. Prefer Close for a
+// direct App call; the leading Client argument exists for DBOS interface
+// dispatch and is intentionally ignored.
+func (a *App) Shutdown(_ dbos.Client, timeout time.Duration) error { return a.Close(timeout) }
 
 // warnStranded logs every in-flight workflow whose recorded name is no longer
 // registered — those runs can never be recovered by this executor, most
 // commonly because a pipeline was renamed between deploys.
 func (a *App) warnStranded() {
-	registered, err := dbos.ListRegisteredWorkflows(a.DBOSContext)
-	if err != nil {
-		a.logger.Warn("duro: stranded-run check skipped: listing registered workflows", "error", err)
-		return
-	}
+	registered := dbos.ListRegisteredWorkflows(a.DBOSContext)
 	active, err := dbos.ListWorkflows(a.DBOSContext,
-		dbos.WithStatus([]dbos.WorkflowStatusType{
+		dbos.WithFilterStatus([]dbos.WorkflowStatusType{
 			dbos.WorkflowStatusPending,
 			dbos.WorkflowStatusEnqueued,
 			dbos.WorkflowStatusDelayed,
-		}),
-		dbos.WithLoadInput(false),
-		dbos.WithLoadOutput(false),
-		dbos.WithLimit(1000),
+		}...),
+		dbos.WithFilterLoadInput(false),
+		dbos.WithFilterLoadOutput(false),
+		dbos.WithFilterLimit(1000),
 	)
 	if err != nil {
 		a.logger.Warn("duro: stranded-run check skipped: listing workflows", "error", err)

@@ -28,7 +28,7 @@ func main() {
 	if err := app.Launch(); err != nil {
 		fatal("launching: %v", err)
 	}
-	defer app.Shutdown(5 * time.Second)
+	defer app.Close(5 * time.Second)
 
 	// 1. A small payment sails through — but watch the risk-check retries.
 	section("fast payment (retries + backoff + durable settle delay)")

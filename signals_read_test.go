@@ -22,7 +22,7 @@ var (
 )
 
 // eventReaderWorkflow durably reads another pipeline's progress event.
-func eventReaderWorkflow(ctx dbos.DBOSContext, sourceID string) (int, error) {
+func eventReaderWorkflow(ctx dbos.Context, sourceID string) (int, error) {
 	return duro.Run(ctx, sourceID, duro.Pipe2(
 		duro.GetEvent("read-progress", lastItemEvent, func(id string) string { return id }, 10*time.Second),
 		duro.Step("double", func(_ context.Context, v int) (int, error) {
@@ -32,7 +32,7 @@ func eventReaderWorkflow(ctx dbos.DBOSContext, sourceID string) (int, error) {
 }
 
 // streamReaderWorkflow drains another pipeline's durable stream and folds it.
-func streamReaderWorkflow(ctx dbos.DBOSContext, sourceID string) (int, error) {
+func streamReaderWorkflow(ctx dbos.Context, sourceID string) (int, error) {
 	return duro.Run(ctx, sourceID, duro.Pipe2(
 		duro.FromStream("drain", outStream, func(id string) string { return id },
 			duro.WithTimeout(10*time.Second)),
@@ -44,7 +44,7 @@ func streamReaderWorkflow(ctx dbos.DBOSContext, sourceID string) (int, error) {
 
 // portablePublishWorkflow publishes its progress event and item stream in the
 // cross-language portable format.
-func portablePublishWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
+func portablePublishWorkflow(ctx dbos.Context, ns []int) (int, error) {
 	return duro.Run(ctx, ns, duro.Pipe4(
 		duro.Expand("explode", explode),
 		duro.SetEvent("progress", portableLastItemEvent, func(v int) int { return v }),
@@ -57,7 +57,7 @@ func portablePublishWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
 
 // portableSenderWorkflow sends a portable-format message to another
 // workflow's mailbox.
-func portableSenderWorkflow(ctx dbos.DBOSContext, destinationID string) (string, error) {
+func portableSenderWorkflow(ctx dbos.Context, destinationID string) (string, error) {
 	return duro.Run(ctx, destinationID, duro.Pipe1(
 		duro.Send("notify", portableNotesTopic, func(dest string) (string, string, error) {
 			return dest, "portable ping", nil
@@ -65,7 +65,7 @@ func portableSenderWorkflow(ctx dbos.DBOSContext, destinationID string) (string,
 	))
 }
 
-func registerReadSideWorkflows(ctx dbos.DBOSContext) {
+func registerReadSideWorkflows(ctx dbos.Context) {
 	dbos.RegisterWorkflow(ctx, eventReaderWorkflow, dbos.WithWorkflowName("eventReaderWorkflow"))
 	dbos.RegisterWorkflow(ctx, streamReaderWorkflow, dbos.WithWorkflowName("streamReaderWorkflow"))
 	dbos.RegisterWorkflow(ctx, portablePublishWorkflow, dbos.WithWorkflowName("portablePublishWorkflow"))

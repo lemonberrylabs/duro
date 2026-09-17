@@ -36,7 +36,7 @@ func main() {
 	if err := app.Launch(); err != nil {
 		fatal("launching: %v", err)
 	}
-	defer app.Shutdown(5 * time.Second)
+	defer app.Close(5 * time.Second)
 
 	batch := []Image{
 		{ID: "img-1", Region: "us", ContentHash: "aaa"},

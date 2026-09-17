@@ -21,7 +21,10 @@ import (
 
 // appVersion pins recovery: only workers on this version take over each other's
 // runs. In production this would be a git SHA or release tag.
-const appVersion = "v1"
+const (
+	appName    = "fleet"
+	appVersion = "v1"
+)
 
 // resizeQueue is the queue the web tier enqueues onto and every worker listens
 // on. The concurrency cap is what makes takeover's queue handling visible: an
@@ -57,7 +60,7 @@ func main() {
 // production defaults are 10s/60s/30s.
 func runWorker(crash bool) {
 	app, err := duro.New(context.Background(), duro.Config{
-		Name:               "fleet",
+		Name:               appName,
 		DatabaseURL:        databaseURL(),
 		ApplicationVersion: appVersion,
 		Logger:             logger(),
@@ -93,16 +96,17 @@ func runWorker(crash bool) {
 
 	fmt.Printf("[%s] running jobs and sweeping for dead workers; Ctrl-C to stop\n", id)
 	waitForSignal()
-	fmt.Printf("[%s] graceful shutdown (tombstones the lease → immediate takeover of any undrained runs)\n", id)
-	app.Shutdown(5 * time.Second)
+	fmt.Printf("[%s] graceful shutdown (tombstones the lease → immediate takeover of interrupted runs)\n", id)
+	app.Close(5 * time.Second)
 }
 
 // runWeb is the enqueue-only tier: it starts a run and polls its status without
 // ever launching an engine.
 func runWeb() {
 	c, err := duro.NewClient(context.Background(), duro.ClientConfig{
-		DatabaseURL: databaseURL(),
-		Logger:      logger(),
+		DatabaseURL:     databaseURL(),
+		ApplicationName: appName,
+		Logger:          logger(),
 	})
 	if err != nil {
 		fatal("initializing client: %v", err)
@@ -140,8 +144,9 @@ func runWeb() {
 // mapping the workers use, so the states it prints are the workers' states.
 func runAdmin(cancelID, resumeID string) {
 	c, err := duro.NewClient(context.Background(), duro.ClientConfig{
-		DatabaseURL: databaseURL(),
-		Logger:      logger(),
+		DatabaseURL:     databaseURL(),
+		ApplicationName: appName,
+		Logger:          logger(),
 		// Every read below fails after 10s instead of hanging for as long as
 		// the database is unreachable (the default bound is 30s).
 		ReadTimeout: 10 * time.Second,

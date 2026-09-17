@@ -62,9 +62,10 @@ workers see.
 
 ## The admin view
 
-The admin role is the same enqueue-only `Client`, used for reads: it registers
-no pipeline, launches no engine, and still sees every run in the system through
-the same status mapping as the workers.
+The admin role is the same enqueue-only `Client`, configured with
+`ApplicationName: "fleet"` for reads: it registers no pipeline, launches no
+engine, and sees every fleet-owned (plus migrated unclaimed) run through the
+same status mapping as the workers.
 
 ```bash
 go run . -role=worker            # terminal 1: a worker to run jobs
@@ -139,7 +140,9 @@ outside the limit its queue exists to enforce, and would stop counting toward it
 which is exactly when nobody is watching.
 
 For the graceful path, stop a worker with Ctrl-C instead: it tombstones its lease
-so any run it could not drain is taken over on the next sweep with no stale wait.
-`Shutdown`'s timeout bounds the drain; the tombstone is written after it, so give
-the process a little grace beyond that timeout or a `SIGKILL` takes the tombstone
-away and survivors fall back to waiting out the stale threshold.
+so interrupted runs are taken over on the next sweep with no stale wait.
+`Close`'s timeout bounds DBOS stopping producers and unwinding local workflow
+goroutines; interrupted rows remain pending. The tombstone is written after
+that, so give the process a little grace beyond the timeout or a `SIGKILL`
+takes the tombstone away and survivors fall back to waiting out the stale
+threshold.

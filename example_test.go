@@ -22,7 +22,7 @@ func Example() {
 		PaymentID string
 	}
 
-	chargeOrder := func(ctx dbos.DBOSContext, o Order) (Receipt, error) {
+	chargeOrder := func(ctx dbos.Context, o Order) (Receipt, error) {
 		return duro.Run(ctx, o, duro.Pipe2(
 			duro.Step("charge", func(_ context.Context, o Order) (string, error) {
 				return "pay-" + o.ID, nil // call your payment provider here

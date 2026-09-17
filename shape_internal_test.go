@@ -24,7 +24,7 @@ func fpStep(name string) Stage[int, int] {
 	return Step(name, func(_ context.Context, v int) (int, error) { return v, nil })
 }
 
-func fpChild(_ dbos.DBOSContext, v int) (int, error) { return v, nil }
+func fpChild(_ dbos.Context, v int) (int, error) { return v, nil }
 
 var fpQueue = NewQueue("fp-corpus-queue")
 

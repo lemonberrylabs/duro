@@ -52,7 +52,7 @@ func cancelChildID(n int) string { return fmt.Sprintf("cancel-child-%d", n) }
 // it blocks through many short steps, so DBOS cancellation (detected at step
 // boundaries) can end it quickly while natural completion takes far longer
 // than any test budget.
-func cancelMixChild(ctx dbos.DBOSContext, n int) (int, error) {
+func cancelMixChild(ctx dbos.Context, n int) (int, error) {
 	cancelChildStarted.Add(1)
 	if n < 0 {
 		time.Sleep(100 * time.Millisecond)
@@ -72,7 +72,7 @@ func cancelMixChild(ctx dbos.DBOSContext, n int) (int, error) {
 
 // cancelShortChild completes (or fails) quickly — for drain-semantics and
 // happy-path tests where children finishing on their own is the point.
-func cancelShortChild(_ dbos.DBOSContext, n int) (int, error) {
+func cancelShortChild(_ dbos.Context, n int) (int, error) {
 	if n < 0 {
 		time.Sleep(50 * time.Millisecond)
 		return 0, fmt.Errorf("synthetic child failure %d", n)
@@ -82,7 +82,7 @@ func cancelShortChild(_ dbos.DBOSContext, n int) (int, error) {
 	return n * n, nil
 }
 
-func cancelGrandchild(_ dbos.DBOSContext, n int) (int, error) {
+func cancelGrandchild(_ dbos.Context, n int) (int, error) {
 	time.Sleep(4 * time.Second)
 	cancelGrandchildDone.Add(1)
 	return n, nil
@@ -91,7 +91,7 @@ func cancelGrandchild(_ dbos.DBOSContext, n int) (int, error) {
 // cancelNestedParent fails slowly for negative items; otherwise it runs its
 // own drain-mode fan-out of one grandchild and awaits it — the shape that
 // proves cancellation does not cascade.
-func cancelNestedParent(ctx dbos.DBOSContext, n int) (int, error) {
+func cancelNestedParent(ctx dbos.Context, n int) (int, error) {
 	if n < 0 {
 		time.Sleep(1 * time.Second)
 		return 0, fmt.Errorf("synthetic child failure %d", n)
@@ -103,7 +103,7 @@ func cancelNestedParent(ctx dbos.DBOSContext, n int) (int, error) {
 
 func explodeInts(_ context.Context, xs []int) ([]int, error) { return xs, nil }
 
-func fanCancelWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func fanCancelWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	return duro.RunAll(ctx, ns, duro.Pipe2(
 		duro.Expand("explode", explodeInts),
 		duro.FanOut("fan", cancelWideQueue, duro.Workflow(cancelMixChild),
@@ -112,7 +112,7 @@ func fanCancelWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
 	))
 }
 
-func fanCancelLimitedWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func fanCancelLimitedWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	return duro.RunAll(ctx, ns, duro.Pipe2(
 		duro.Expand("explode", explodeInts),
 		duro.FanOut("fan", cancelLimitedQueue, duro.Workflow(cancelMixChild),
@@ -120,7 +120,7 @@ func fanCancelLimitedWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
 	))
 }
 
-func fanCancelShortWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func fanCancelShortWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	return duro.RunAll(ctx, ns, duro.Pipe2(
 		duro.Expand("explode", explodeInts),
 		duro.FanOut("fan", cancelWideQueue, duro.Workflow(cancelShortChild),
@@ -129,7 +129,7 @@ func fanCancelShortWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
 	))
 }
 
-func fanDrainWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func fanDrainWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	return duro.RunAll(ctx, ns, duro.Pipe2(
 		duro.Expand("explode", explodeInts),
 		duro.FanOut("fan", cancelWideQueue, duro.Workflow(cancelShortChild),
@@ -137,7 +137,7 @@ func fanDrainWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
 	))
 }
 
-func fanCancelRescueWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
+func fanCancelRescueWorkflow(ctx dbos.Context, ns []int) (int, error) {
 	return duro.Run(ctx, ns, duro.Pipe1(
 		duro.Rescue("save", duro.Pipe2(
 			duro.Expand("explode", explodeInts),
@@ -150,7 +150,7 @@ func fanCancelRescueWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
 	))
 }
 
-func fanCancelNestedWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func fanCancelNestedWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	return duro.RunAll(ctx, ns, duro.Pipe2(
 		duro.Expand("explode", explodeInts),
 		duro.FanOut("outer", cancelWideQueue, duro.Workflow(cancelNestedParent),
@@ -160,7 +160,7 @@ func fanCancelNestedWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
 
 // fanShapeToggleWorkflow flips WithCancelSiblings on a package flag —
 // simulating a deploy that toggles the option while a run is in flight.
-func fanShapeToggleWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func fanShapeToggleWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	opts := []duro.ChildOption{duro.WithChildID(cancelChildID)}
 	if fanCancelToggle.Load() {
 		opts = append(opts, duro.WithCancelSiblings())
@@ -171,7 +171,7 @@ func fanShapeToggleWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
 	))
 }
 
-func parCancelWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func parCancelWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	return duro.RunAll(ctx, ns, duro.Pipe2(
 		duro.Expand("explode", explodeInts),
 		duro.Parallel("par", duro.Unbounded, func(ctx context.Context, n int) (int, error) {
@@ -190,7 +190,7 @@ func parCancelWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
 	))
 }
 
-func parSkipWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func parSkipWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	return duro.RunAll(ctx, ns, duro.Pipe2(
 		duro.Expand("explode", explodeInts),
 		duro.Parallel("par", 1, func(_ context.Context, n int) (int, error) {
@@ -203,7 +203,7 @@ func parSkipWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
 	))
 }
 
-func parCancelRescueWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
+func parCancelRescueWorkflow(ctx dbos.Context, ns []int) (int, error) {
 	return duro.Run(ctx, ns, duro.Pipe1(
 		duro.Rescue("save", duro.Pipe2(
 			duro.Expand("explode", explodeInts),
@@ -227,7 +227,7 @@ func parCancelRescueWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
 	))
 }
 
-func registerCancelWorkflows(ctx dbos.DBOSContext) {
+func registerCancelWorkflows(ctx dbos.Context) {
 	dbos.RegisterWorkflow(ctx, cancelMixChild, dbos.WithWorkflowName("cancelMixChild"))
 	dbos.RegisterWorkflow(ctx, cancelShortChild, dbos.WithWorkflowName("cancelShortChild"))
 	dbos.RegisterWorkflow(ctx, cancelGrandchild, dbos.WithWorkflowName("cancelGrandchild"))
@@ -262,9 +262,9 @@ func mustFail[P, R any](t *testing.T, wf dbos.Workflow[P, R], input P) (error, s
 func childState(t *testing.T, workflowID string) dbos.WorkflowStatusType {
 	t.Helper()
 	statuses, err := dbos.ListWorkflows(dctx,
-		dbos.WithWorkflowIDs([]string{workflowID}),
-		dbos.WithLoadInput(false),
-		dbos.WithLoadOutput(false),
+		dbos.WithFilterWorkflowIDs(workflowID),
+		dbos.WithFilterLoadInput(false),
+		dbos.WithFilterLoadOutput(false),
 	)
 	if err != nil {
 		t.Fatalf("listing workflow %s: %v", workflowID, err)

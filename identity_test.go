@@ -26,7 +26,7 @@ func TestConfigIdentityPropagates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer a.Shutdown(5 * time.Second)
+	defer a.Close(5 * time.Second)
 
 	if got := a.Context().GetApplicationVersion(); got != "v-config-1" {
 		t.Errorf("ApplicationVersion = %q, want %q", got, "v-config-1")
@@ -53,7 +53,7 @@ func TestConfigIdentityEnvOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer a.Shutdown(5 * time.Second)
+	defer a.Close(5 * time.Second)
 
 	if got := a.Context().GetApplicationVersion(); got != "v-env-2" {
 		t.Errorf("ApplicationVersion = %q, want env override %q", got, "v-env-2")
@@ -76,12 +76,39 @@ func TestConfigIdentityDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer a.Shutdown(5 * time.Second)
+	defer a.Close(5 * time.Second)
 
 	if got := a.Context().GetApplicationVersion(); got == "" {
 		t.Error("ApplicationVersion is empty, want DBOS's computed default")
 	}
 	if got := a.Context().GetExecutorID(); got != "local" {
 		t.Errorf("ExecutorID = %q, want DBOS default %q", got, "local")
+	}
+}
+
+func TestAppLaunchMayOnlyRunOnceWithoutClosingTheApp(t *testing.T) {
+	t.Setenv("DBOS__APPVERSION", "")
+	t.Setenv("DBOS__VMID", "")
+	a, err := duro.New(context.Background(), duro.Config{
+		Name:        "duro-test-launch-once",
+		DatabaseURL: testDatabaseURL(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	wf := duro.Register(a, "launch-once-pipeline", r3EchoPipeline())
+	if err := a.Launch(); err != nil {
+		t.Fatalf("first Launch: %v", err)
+	}
+	defer a.Close(5 * time.Second)
+	if err := a.Launch(); err == nil {
+		t.Fatal("second Launch succeeded, want a one-shot lifecycle error")
+	}
+	h, err := wf.Start(a, 2)
+	if err != nil {
+		t.Fatalf("Start after rejected second Launch: %v", err)
+	}
+	if got, err := h.Result(); err != nil || got != 1002 {
+		t.Fatalf("Result after rejected second Launch = %d, %v; want 1002", got, err)
 	}
 }

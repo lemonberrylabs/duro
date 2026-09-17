@@ -163,7 +163,7 @@ func TestJobNameRoundTrips(t *testing.T) {
 // --- Run's single-value contract -------------------------------------------
 
 // guardMultiValuePipeline emits three values, so Run cannot pick one.
-func guardMultiValueWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
+func guardMultiValueWorkflow(ctx dbos.Context, n int) (int, error) {
 	return duro.Run(ctx, n, duro.Pipe2(
 		duro.Expand("guard-explode", func(_ context.Context, v int) ([]int, error) {
 			return []int{v, v + 1, v + 2}, nil
@@ -174,7 +174,7 @@ func guardMultiValueWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
 
 // guardSingleValueWorkflow is the same shape folded back to one value, which
 // Run must still accept.
-func guardSingleValueWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
+func guardSingleValueWorkflow(ctx dbos.Context, n int) (int, error) {
 	return duro.Run(ctx, n, duro.Pipe3(
 		duro.Expand("guard-explode-2", func(_ context.Context, v int) ([]int, error) {
 			return []int{v, v + 1, v + 2}, nil
@@ -220,7 +220,7 @@ var guardLoopBodyRuns atomic.Int64
 
 // guardBoundedLoopWorkflow loops with a predicate that never reports done, so
 // only the bound can stop it.
-func guardBoundedLoopWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
+func guardBoundedLoopWorkflow(ctx dbos.Context, n int) (int, error) {
 	return duro.Run(ctx, n, duro.Pipe1(
 		duro.Loop("guard-loop",
 			duro.Pipe1(duro.Step("guard-loop-body", func(_ context.Context, v int) (int, error) {
@@ -264,7 +264,7 @@ func TestUnboundedLoopStillTerminatesNormally(t *testing.T) {
 	}
 }
 
-func guardUnboundedLoopWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
+func guardUnboundedLoopWorkflow(ctx dbos.Context, n int) (int, error) {
 	return duro.Run(ctx, n, duro.Pipe1(
 		duro.Loop("guard-free-loop",
 			duro.Pipe1(duro.Step("guard-free-body", func(_ context.Context, v int) (int, error) {
@@ -352,7 +352,7 @@ var guardComboBodyRuns atomic.Int64
 // at 2 settles in one iteration, an item entering at 0 cannot reach 3 within
 // the two-iteration bound and trips it, and a negative item takes the other
 // Branch arm and never sees the loop at all.
-func guardLoopInRescueWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func guardLoopInRescueWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	bounded := duro.Pipe1(duro.Loop("combo-loop",
 		duro.Pipe1(duro.Step("combo-body", func(_ context.Context, v int) (int, error) {
 			guardComboBodyRuns.Add(1)
@@ -400,7 +400,7 @@ func TestLoopBoundComposesWithRescueAndBranch(t *testing.T) {
 	}
 }
 
-func registerGuardWorkflows(ctx dbos.DBOSContext) {
+func registerGuardWorkflows(ctx dbos.Context) {
 	dbos.RegisterWorkflow(ctx, guardMultiValueWorkflow, dbos.WithWorkflowName("guardMultiValueWorkflow"))
 	dbos.RegisterWorkflow(ctx, guardSingleValueWorkflow, dbos.WithWorkflowName("guardSingleValueWorkflow"))
 	dbos.RegisterWorkflow(ctx, guardBoundedLoopWorkflow, dbos.WithWorkflowName("guardBoundedLoopWorkflow"))

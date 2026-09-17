@@ -34,7 +34,7 @@ var (
 )
 
 // branchWorkflow routes each item by parity: evens halve, odds triple.
-func branchWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func branchWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	return duro.Run(ctx, ns, duro.Pipe3(
 		duro.Expand("explode", explode),
 		duro.Branch("route", func(_ context.Context, v int) (bool, error) {
@@ -45,7 +45,7 @@ func branchWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
 }
 
 // switchWorkflow dispatches on a string key; "boom" routes to no case.
-func switchWorkflow(ctx dbos.DBOSContext, kinds []string) ([]string, error) {
+func switchWorkflow(ctx dbos.Context, kinds []string) ([]string, error) {
 	return duro.Run(ctx, kinds, duro.Pipe3(
 		duro.Expand("explode", func(_ context.Context, ks []string) ([]string, error) {
 			return ks, nil
@@ -65,7 +65,7 @@ func switchWorkflow(ctx dbos.DBOSContext, kinds []string) ([]string, error) {
 }
 
 // loopWorkflow increments until the value reaches 4: do-while durable loop.
-func loopWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
+func loopWorkflow(ctx dbos.Context, n int) (int, error) {
 	return duro.Run(ctx, n, duro.Pipe1(
 		duro.Loop("until-four", duro.Pipe1(duro.Step("inc", func(_ context.Context, v int) (int, error) {
 			loopRuns.Add(1)
@@ -77,7 +77,7 @@ func loopWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
 }
 
 // subWorkflow embeds a whole-stream fold: Sub is not per-item.
-func subWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
+func subWorkflow(ctx dbos.Context, ns []int) (int, error) {
 	sum := duro.Pipe1(duro.Reduce("sum", func(_ context.Context, acc, v int) (int, error) {
 		return acc + v, nil
 	}, 0))
@@ -89,7 +89,7 @@ func subWorkflow(ctx dbos.DBOSContext, ns []int) (int, error) {
 
 // collectEmptyWorkflow proves Collect turns an empty stream into an empty
 // slice instead of ErrNoValue.
-func collectEmptyWorkflow(ctx dbos.DBOSContext, n int) ([]int, error) {
+func collectEmptyWorkflow(ctx dbos.Context, n int) ([]int, error) {
 	return duro.Run(ctx, n, duro.Pipe2(
 		duro.Filter("drop-all", func(_ context.Context, _ int) (bool, error) { return false, nil }),
 		duro.Collect[int]("collect"),
@@ -100,7 +100,7 @@ func collectEmptyWorkflow(ctx dbos.DBOSContext, n int) ([]int, error) {
 // run and a replay, for the nested shape-guard test.
 var includeExtraArmStage = false
 
-func mutableBranchWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
+func mutableBranchWorkflow(ctx dbos.Context, n int) (int, error) {
 	then := duro.Pipe1(duro.Step("double", func(_ context.Context, v int) (int, error) { return v * 2, nil }))
 	if includeExtraArmStage {
 		then = duro.Pipe2(
@@ -118,7 +118,7 @@ func mutableBranchWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
 
 // loopDropWorkflow's body filters its item away: the loop must end without
 // emitting, and Run reports ErrNoValue.
-func loopDropWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
+func loopDropWorkflow(ctx dbos.Context, n int) (int, error) {
 	return duro.Run(ctx, n, duro.Pipe1(
 		duro.Loop("drop-loop", duro.Pipe1(
 			duro.Filter("drop", func(_ context.Context, _ int) (bool, error) { return false, nil }),
@@ -129,7 +129,7 @@ func loopDropWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
 var armAfterFailureRuns atomic.Int64
 
 // branchFailureWorkflow fails inside the then-arm on item 2.
-func branchFailureWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func branchFailureWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	arm := duro.Pipe1(duro.Step("check", func(_ context.Context, v int) (int, error) {
 		if v == 2 {
 			return 0, errors.New("boom: two is forbidden")
@@ -162,7 +162,7 @@ var (
 // Rescue(failing inner) → outer stage. Item 2 fails inside the rescued
 // pipeline; the handler swallows with a negated fallback, and the trailing
 // stages must keep executing for it and for the items behind it.
-func rescueSwallowWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func rescueSwallowWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	boom := duro.Pipe1(duro.Step("boom", func(_ context.Context, v int) (int, error) {
 		if v == 2 {
 			return 0, errors.New("boom: two is forbidden")
@@ -185,7 +185,7 @@ func rescueSwallowWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
 // rescuePartialWorkflow's embedded pipeline expands each item into two and
 // fails on value 3: item 2's successful first emission must be discarded in
 // favor of the fallback, while item 5's two emissions pass through in order.
-func rescuePartialWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func rescuePartialWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	inner := duro.Pipe2(
 		duro.Expand("fan", func(_ context.Context, v int) ([]int, error) {
 			return []int{v, v + 1}, nil
@@ -209,7 +209,7 @@ func rescuePartialWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
 // rescueRethrowWorkflow's handler transforms the failure and returns it: the
 // outer pipeline must fail with the transformed error and stay fail-fast for
 // the items behind the failure.
-func rescueRethrowWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func rescueRethrowWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	inner := duro.Pipe1(duro.Step("check", func(_ context.Context, v int) (int, error) {
 		if v == 2 {
 			return 0, errors.New("two is forbidden")
@@ -228,7 +228,7 @@ func rescueRethrowWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
 
 // rescueUpstreamWorkflow fails before the Rescue stage: only embedded
 // failures are rescuable, so the handler must never run.
-func rescueUpstreamWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
+func rescueUpstreamWorkflow(ctx dbos.Context, n int) (int, error) {
 	return duro.Run(ctx, n, duro.Pipe2(
 		duro.Step("pre", func(_ context.Context, _ int) (int, error) {
 			return 0, errors.New("upstream failure")
@@ -244,7 +244,7 @@ func rescueUpstreamWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
 // rescueRetryWorkflow is the retry-then-swallow shape: real stage retry
 // options on the embedded step, with the handler firing only after they are
 // exhausted.
-func rescueRetryWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
+func rescueRetryWorkflow(ctx dbos.Context, n int) (int, error) {
 	flaky := duro.Pipe1(duro.Step("always-fails", func(_ context.Context, _ int) (int, error) {
 		rescueRetryAttempts.Add(1)
 		return 0, errors.New("permanently down")
@@ -258,7 +258,7 @@ func rescueRetryWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
 
 // rescueNestedWorkflow nests Rescue in Rescue: the inner handler wins for
 // inner failures, and rethrowing from it escalates to the outer handler.
-func rescueNestedWorkflow(ctx dbos.DBOSContext, n int) (string, error) {
+func rescueNestedWorkflow(ctx dbos.Context, n int) (string, error) {
 	boom := duro.Pipe1(duro.Step("boom", func(_ context.Context, v int) (string, error) {
 		return "", fmt.Errorf("boom on %d", v)
 	}))
@@ -286,7 +286,7 @@ var errCrashSentinel = errors.New("boom: crash-window failure")
 // failing step (step 2), the handler checkpoint (step 3), post (step 4).
 // Forking between steps 2 and 3 simulates a process death after the embedded
 // failure was recorded but before the rescue decision was.
-func rescueCrashWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
+func rescueCrashWorkflow(ctx dbos.Context, n int) (int, error) {
 	boom := duro.Pipe1(duro.Step("boom", func(_ context.Context, _ int) (int, error) {
 		rescueCrashBoomRuns.Add(1)
 		return 0, errCrashSentinel
@@ -305,7 +305,7 @@ func rescueCrashWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
 
 // fanChildSquareOrFail is the child workflow for the Rescue+FanOut test:
 // squares non-negatives, fails on negatives.
-func fanChildSquareOrFail(_ dbos.DBOSContext, n int) (int, error) {
+func fanChildSquareOrFail(_ dbos.Context, n int) (int, error) {
 	if n < 0 {
 		return 0, fmt.Errorf("fan child: negative input %d", n)
 	}
@@ -322,7 +322,7 @@ var rescueFanWf *duro.PipelineWorkflow[[]int, []int]
 // item spreads into three concurrent squares, and a fleet containing a
 // negative fails as a unit — rescued to the original item, with the next
 // item's fleet unaffected.
-func rescueParallelWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func rescueParallelWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	fleet := duro.Pipe2(
 		duro.Expand("spread", func(_ context.Context, v int) ([]int, error) {
 			return []int{v, v + 1, v + 2}, nil
@@ -353,7 +353,7 @@ var (
 // viaPassThroughWorkflow routes each item through a Via whose embedded
 // pipeline emits zero, one, or many values depending on the item — the
 // original item must come out the other side in every case.
-func viaPassThroughWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func viaPassThroughWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	effects := duro.Pipe2(
 		// 0 → drop (zero emissions), 1 → [v] (one), 2 → [v, v] (many).
 		duro.Expand("fan", func(_ context.Context, v int) ([]int, error) {
@@ -378,7 +378,7 @@ func viaPassThroughWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
 // viaFailureWorkflow fails inside the Via's embedded pipeline on item 2:
 // the outer pipeline must fail fast and the stage after the Via must never
 // run for items behind the failure.
-func viaFailureWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func viaFailureWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	boom := duro.Pipe1(duro.Tap("boom", func(_ context.Context, v int) error {
 		if v == 2 {
 			return errors.New("boom: two is forbidden")
@@ -399,7 +399,7 @@ func viaFailureWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
 // viaRescuedWorkflow composes the best-effort fan-out shape:
 // Rescue(Pipe1(Via(...))) continues with the original item whether the
 // embedded effects succeeded or failed.
-func viaRescuedWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
+func viaRescuedWorkflow(ctx dbos.Context, ns []int) ([]int, error) {
 	boom := duro.Pipe1(duro.Tap("boom", func(_ context.Context, v int) error {
 		if v == 2 {
 			return errors.New("boom: two is forbidden")
@@ -422,7 +422,7 @@ func viaRescuedWorkflow(ctx dbos.DBOSContext, ns []int) ([]int, error) {
 
 // viaFanChildLog is the child workflow for the Via+FanOut test; the parent
 // discards its results, so it only counts executions.
-func viaFanChildLog(_ dbos.DBOSContext, n int) (int, error) {
+func viaFanChildLog(_ dbos.Context, n int) (int, error) {
 	viaFanChildRuns.Add(1)
 	return n, nil
 }
@@ -437,7 +437,7 @@ var viaFanWf *duro.PipelineWorkflow[[]int, []int]
 // the original run and a replay, for the shape-guard test.
 var includeExtraViaStage = false
 
-func mutableViaWorkflow(ctx dbos.DBOSContext, n int) (int, error) {
+func mutableViaWorkflow(ctx dbos.Context, n int) (int, error) {
 	effects := duro.Pipe1(duro.Tap("noop", func(_ context.Context, _ int) error { return nil }))
 	if includeExtraViaStage {
 		effects = duro.Pipe2(
@@ -457,7 +457,7 @@ var flowQueue = duro.NewQueue("duro-test-flow", duro.WithConcurrency(2))
 
 var flowQueueWf *duro.PipelineWorkflow[[]int, []int]
 
-func registerFlowWorkflows(ctx dbos.DBOSContext) {
+func registerFlowWorkflows(ctx dbos.Context) {
 	dbos.RegisterWorkflow(ctx, branchWorkflow, dbos.WithWorkflowName("branchWorkflow"))
 	dbos.RegisterWorkflow(ctx, switchWorkflow, dbos.WithWorkflowName("switchWorkflow"))
 	dbos.RegisterWorkflow(ctx, loopWorkflow, dbos.WithWorkflowName("loopWorkflow"))
