@@ -93,7 +93,20 @@ are:
   DBOS context instead of `duro.App`.
 - DBOS v1 scopes ordinary listings, stale-run checks, and retention to the
   configured application plus unclaimed pre-v1 rows. Use a nameless client or
-  `WithApplicationNames` for a deliberate cross-application view.
+  `WithApplicationNames` for a deliberate cross-application view. Unclaimed
+  rows belong to whoever takes them first: a worker claims a row when it
+  dequeues or takes it over, and every application's workers poll every
+  registered queue they can see. If two applications share a database, the
+  first to upgrade claims the other's pre-v1 runs, cannot run them, and the
+  owner can no longer adopt them — keep one database per application, as
+  before.
+- A run enqueued with no application version — a Client's default — is dequeued
+  only by workers on the **latest registered** application version; v0.18 let
+  any version take it. "Latest" is the version that registered most recently,
+  so a fleet relaunched on an older version string, or overtaken by any process
+  that launches under a newer one, silently stops receiving Client traffic.
+  `Launch` warns when an executor starts in that state, `WithStaleRunWarning`
+  warns when it falls into it later and counts unstamped runs accordingly.
 - Cancellation watchers now use an application-qualified queue returned by
   `CancelWatchQueueNameFor(appName)`. Duro also claims the legacy unsuffixed
   queue where possible so pending v0 watchers can drain.
@@ -779,7 +792,12 @@ delay a takeover.
 
 Both run on the sweep cadence. DBOS v1 scopes them to this application and
 unclaimed rows migrated from pre-v1 releases; rows already owned by another
-application sharing the database are neither counted nor deleted.
+application sharing the database are neither counted nor deleted. Unclaimed
+rows are both counted and deleted, whichever application wrote them. The
+stale-run split follows DBOS's dequeue rule: a run with no recorded version
+counts as `SameVersion` only while this executor is on the latest registered
+application version, and the warning also reports, once per change, when it is
+not.
 
 ## Built-in safety
 
