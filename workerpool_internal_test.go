@@ -839,6 +839,10 @@ func TestTakeoverEligibility(t *testing.T) {
 		{"r2a-success", "SUCCESS", "r2a-dead", ver, app, false},                      // terminal
 		{"r2a-cancelled", "CANCELLED", "r2a-dead", ver, app, false},                  // terminal
 		{"r2a-otherapp-pending", "PENDING", "r2a-otherapp", ver, "other-app", false}, // dead heartbeat from another app
+		// Unclaimed, so ownership does not exclude it: only the heartbeat's
+		// application does. Without that scoping, this app would adopt — and
+		// claim — another application's pre-v1 run.
+		{"r2a-otherapp-unclaimed", "PENDING", "r2a-otherapp", ver, "", false},
 	}
 	want := map[string]bool{}
 	for _, c := range cases {

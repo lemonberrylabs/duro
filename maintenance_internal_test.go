@@ -1,11 +1,14 @@
 package duro
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/dbos-inc/dbos-transact-golang/dbos"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -82,7 +85,7 @@ func TestStaleRunWarning(t *testing.T) {
 	pool := app.wp.pool
 	app.wp.staleRunWarn = time.Hour
 
-	before, err := app.wp.checkStaleRuns()
+	before, _, err := app.wp.checkStaleRuns()
 	if err != nil {
 		t.Fatalf("baseline checkStaleRuns: %v", err)
 	}
@@ -100,7 +103,7 @@ func TestStaleRunWarning(t *testing.T) {
 		pool.Exec(context.Background(), "DELETE FROM dbos.workflow_status WHERE workflow_uuid LIKE 'r4-%'")
 	})
 
-	info, err := app.wp.checkStaleRuns()
+	info, _, err := app.wp.checkStaleRuns()
 	if err != nil {
 		t.Fatalf("checkStaleRuns: %v", err)
 	}
@@ -126,6 +129,154 @@ func TestStaleRunWarning(t *testing.T) {
 	app.wp.runStaleRunWarning()
 	if got != (StaleRunInfo{}) {
 		t.Errorf("hook called for a 100h window with no runs that old: %+v", got)
+	}
+}
+
+// TestSplitStaleRuns pins where each kind of stale run is counted. A run with
+// no recorded version is what a Client enqueues by default, and DBOS lets only
+// the latest registered version dequeue it — so it is this executor's to run
+// exactly while this executor's version is the latest.
+func TestSplitStaleRuns(t *testing.T) {
+	count := func(n int64) *int64 { return &n }
+	recorded := func(v string) map[string]*string { return map[string]*string{"application_version": &v} }
+	rows := []dbos.WorkflowAggregateRow{
+		{Group: recorded("v1"), Count: count(3)},
+		{Group: recorded("v0"), Count: count(5)},
+		{Group: map[string]*string{"application_version": nil}, Count: count(7)},
+		{Group: recorded("v1"), Count: nil},
+	}
+	if got, want := splitStaleRuns(rows, "v1", true), (StaleRunInfo{SameVersion: 3 + 7, OtherVersion: 5}); got != want {
+		t.Errorf("on the latest version: got %+v, want %+v", got, want)
+	}
+	if got, want := splitStaleRuns(rows, "v1", false), (StaleRunInfo{SameVersion: 3, OtherVersion: 5 + 7}); got != want {
+		t.Errorf("off the latest version: got %+v, want %+v", got, want)
+	}
+}
+
+// TestStaleRunWarningFollowsLatestVersion drives the same split through the
+// database: a stale run with no recorded version moves from SameVersion to
+// OtherVersion the moment a newer application version registers, and the
+// executor is told once that it fell off the latest version (and once when it
+// is back).
+func TestStaleRunWarningFollowsLatestVersion(t *testing.T) {
+	const ver = "r4-latest-gate-own"
+	app := newMaintenanceApp(t, ver)
+	pool := app.wp.pool
+	app.wp.staleRunWarn = time.Hour
+	ctx := context.Background()
+
+	// Register versions under this app's own name, dated far enough ahead that
+	// no unclaimed row another test leaves behind can outrank them.
+	registerVersion := func(name string, ahead time.Duration) {
+		t.Helper()
+		ts := time.Now().Add(ahead).UnixMilli()
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO dbos.application_versions (version_id, version_name, version_timestamp, created_at, application_name)
+			 VALUES ($1,$1,$2,$2,$3)`, name, ts, app.wp.appName); err != nil {
+			t.Fatalf("register version %s: %v", name, err)
+		}
+	}
+	t.Cleanup(func() {
+		pool.Exec(ctx, "DELETE FROM dbos.application_versions WHERE version_name LIKE 'r4-latest-gate-%'")
+		pool.Exec(ctx, "DELETE FROM dbos.workflow_status WHERE workflow_uuid LIKE 'r4lg-%'")
+	})
+	registerVersion(ver, 24*time.Hour)
+
+	before, latest, err := app.wp.checkStaleRuns()
+	if err != nil {
+		t.Fatalf("baseline checkStaleRuns: %v", err)
+	}
+	if latest != ver {
+		t.Fatalf("latest version = %q, want this executor's %q", latest, ver)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO dbos.workflow_status (workflow_uuid, name, status, application_version, created_at, updated_at)
+		 VALUES ('r4lg-unstamped', 'seeded-r4lg', 'ENQUEUED', NULL, $1, $1)`,
+		time.Now().Add(-2*time.Hour).UnixMilli()); err != nil {
+		t.Fatalf("seed unstamped run: %v", err)
+	}
+
+	onLatest, _, err := app.wp.checkStaleRuns()
+	if err != nil {
+		t.Fatalf("checkStaleRuns on the latest version: %v", err)
+	}
+	if same, other := onLatest.SameVersion-before.SameVersion, onLatest.OtherVersion-before.OtherVersion; same != 1 || other != 0 {
+		t.Errorf("on the latest version the unstamped run counted same=%d other=%d, want same=1 other=0", same, other)
+	}
+
+	registerVersion("r4-latest-gate-newer", 48*time.Hour)
+	offLatest, latest, err := app.wp.checkStaleRuns()
+	if err != nil {
+		t.Fatalf("checkStaleRuns off the latest version: %v", err)
+	}
+	if latest != "r4-latest-gate-newer" {
+		t.Errorf("latest version = %q, want the newer registration", latest)
+	}
+	if same, other := offLatest.SameVersion-before.SameVersion, offLatest.OtherVersion-before.OtherVersion; same != 0 || other != 1 {
+		t.Errorf("off the latest version the unstamped run counted same=%d other=%d, want same=0 other=1", same, other)
+	}
+
+	// The executor hears about the change once per change, not once per cycle.
+	var logged bytes.Buffer
+	app.wp.logger = slog.New(slog.NewTextHandler(&logged, nil))
+	app.wp.runStaleRunWarning()
+	app.wp.runStaleRunWarning()
+	if n := strings.Count(logged.String(), "not on the latest registered application version"); n != 1 {
+		t.Errorf("not-latest warning logged %d times across two cycles, want 1:\n%s", n, logged.String())
+	}
+	if _, err := pool.Exec(ctx, "DELETE FROM dbos.application_versions WHERE version_name = 'r4-latest-gate-newer'"); err != nil {
+		t.Fatalf("remove newer version: %v", err)
+	}
+	app.wp.runStaleRunWarning()
+	if !strings.Contains(logged.String(), "on the latest registered application version again") {
+		t.Errorf("no recovery line after the newer version was removed:\n%s", logged.String())
+	}
+}
+
+// TestLaunchWarnsWhenNotOnLatestVersion covers the rollback shape: an executor
+// relaunched on a version string older than one already registered for its
+// application. DBOS never re-dates a known version, so it stays non-latest and
+// will never dequeue a run enqueued with no version — Launch has to say so.
+func TestLaunchWarnsWhenNotOnLatestVersion(t *testing.T) {
+	t.Setenv("DBOS__APPVERSION", "")
+	const appName = "duro-launch-not-latest"
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, wpURL())
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	defer pool.Close()
+
+	var logged bytes.Buffer
+	app, err := New(ctx, Config{
+		Name:               appName,
+		DatabaseURL:        wpURL(),
+		Logger:             slog.New(slog.NewTextHandler(&logged, nil)),
+		ApplicationVersion: "launch-gate-old",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		app.Close(5 * time.Second)
+		pool.Exec(ctx, "DELETE FROM dbos.application_versions WHERE version_name LIKE 'launch-gate-%'")
+	})
+	// A newer version of the same application is already on record.
+	ts := time.Now().Add(24 * time.Hour).UnixMilli()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO dbos.application_versions (version_id, version_name, version_timestamp, created_at, application_name)
+		 VALUES ('launch-gate-new','launch-gate-new',$1,$1,$2)
+		 ON CONFLICT (version_name) DO UPDATE SET version_timestamp = EXCLUDED.version_timestamp`, ts, appName); err != nil {
+		t.Fatalf("register newer version: %v", err)
+	}
+
+	if err := app.Launch(); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	out := logged.String()
+	if !strings.Contains(out, "not on the latest registered application version") ||
+		!strings.Contains(out, "latest_version=launch-gate-new") {
+		t.Errorf("Launch did not warn about the newer registered version:\n%s", out)
 	}
 }
 
@@ -225,7 +376,7 @@ func TestMaintenanceDBOSCallsObserveStopMaintenance(t *testing.T) {
 	app := newMaintenanceApp(t, "maint-ctx-version")
 
 	// Both duties work while the scope is live.
-	if _, err := app.wp.checkStaleRuns(); err != nil {
+	if _, _, err := app.wp.checkStaleRuns(); err != nil {
 		t.Fatalf("checkStaleRuns before cancellation: %v", err)
 	}
 	if _, err := app.wp.sweepRetention(); err != nil {
@@ -237,7 +388,7 @@ func TestMaintenanceDBOSCallsObserveStopMaintenance(t *testing.T) {
 	// the app context and ignore cancellation entirely.
 	app.wp.maintDctxCancel()
 
-	if _, err := app.wp.checkStaleRuns(); err == nil {
+	if _, _, err := app.wp.checkStaleRuns(); err == nil {
 		t.Error("checkStaleRuns succeeded after the maintenance DBOS context was cancelled — its aggregate query runs on the app context and will hold Shutdown open")
 	}
 	if _, err := app.wp.sweepRetention(); err == nil {

@@ -245,6 +245,7 @@ func (a *App) Launch() error {
 		a.wp.start()
 	}
 	a.warnStranded()
+	a.warnNotLatestVersion()
 	return nil
 }
 
@@ -259,15 +260,26 @@ func (a *App) Launch() error {
 // adopted by a survivor on its next sweep with no stale wait. Follow Close
 // promptly with process exit.
 //
-// timeout bounds DBOS shutdown. The two steps around it are bounded separately and
-// take milliseconds against a healthy database: stopping maintenance cancels
+// timeout bounds each stage of DBOS shutdown in turn, not the call: DBOS waits
+// up to timeout for its queue runner, then for in-flight workflows, then for
+// the system-database pool. Cancelling the root context stops the first and
+// the last in milliseconds against a healthy database, so the call costs what
+// the workflows stage costs — the full timeout whenever a run is mid-step and
+// does not return — though a database that hangs the pool close adds a second
+// timeout. The two steps around DBOS are bounded separately and also take
+// milliseconds against a healthy database: stopping maintenance cancels
 // whatever query it has in flight rather than waiting it out, and the tombstone
 // is a single primary-key UPDATE bounded by a few seconds of its own. Budget
 // timeout plus a small constant for the whole call — never let timeout consume
 // the entire SIGTERM grace period, or the tombstone is the part that is lost.
 //
-// Calling Close more than once is safe; the extra calls do nothing. It returns
-// an error if DBOS could not stop every resource before timeout.
+// Close returns an error naming what DBOS could not stop before timeout;
+// "workflows" is the expected answer when a long run is mid-step, and that run
+// stays PENDING. Calling Close again is safe: duro's own steps (stopping
+// maintenance, the tombstone, its pools) run once. After a Close that returned
+// nil the extra calls do nothing; after one that timed out, DBOS waits again,
+// for up to timeout per stage — so do not pair a deferred Close with a second
+// one on the signal path unless the grace period can pay for both.
 func (a *App) Close(timeout time.Duration) error {
 	if a.wp != nil {
 		a.wp.stopMaintenance()
@@ -296,6 +308,26 @@ func (a *App) Close(timeout time.Duration) error {
 // direct App call; the leading Client argument exists for DBOS interface
 // dispatch and is intentionally ignored.
 func (a *App) Shutdown(_ dbos.Client, timeout time.Duration) error { return a.Close(timeout) }
+
+// warnNotLatestVersion logs when this executor launched on an application
+// version that is not the latest registered one — relaunching an older version
+// string does that, since DBOS never re-dates a version it already knows. Such
+// an executor never dequeues a run enqueued with no version, and nothing else
+// reports it. With WithStaleRunWarning the check also repeats on the sweep
+// cadence, for a newer version that registers later.
+func (a *App) warnNotLatestVersion() {
+	ctx, cancel := dbos.WithTimeout(a.DBOSContext, opTimeout)
+	defer cancel()
+	version := a.DBOSContext.GetApplicationVersion()
+	latest, err := latestApplicationVersion(ctx, version)
+	if err != nil {
+		a.logger.Warn("duro: latest-version check skipped", "error", err)
+		return
+	}
+	if latest != version {
+		a.logger.Warn(notLatestVersionWarning, "application_version", version, "latest_version", latest)
+	}
+}
 
 // warnStranded logs every in-flight workflow whose recorded name is no longer
 // registered — those runs can never be recovered by this executor, most

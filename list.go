@@ -68,6 +68,10 @@ func WithIDs(ids ...string) ListOption {
 // WithApplicationNames restricts an administrative Client listing to the
 // named DBOS applications. Engine listings are already scoped to their own
 // application (plus unclaimed migrated rows) unless this filter is explicit.
+// Unclaimed runs — recorded with no application name: every run written before
+// DBOS v1, and a nameless Client's enqueues until a worker claims them — match
+// whatever names are given. DBOS's filter cannot exclude them; tell them apart
+// by an empty RunStatus.ApplicationName.
 func WithApplicationNames(names ...string) ListOption {
 	return func(c *listConfig) { c.filter(len(names), dbos.WithFilterApplicationName(names...)) }
 }

@@ -220,7 +220,12 @@ type EnqueueOption func(*enqueueConfig)
 // version, so only workers on that version dequeue it. By default a client
 // stamps no version (NULL), which DBOS routes to the owning application's
 // latest registered version — the right default for a web tier that should not
-// need redeploying in lockstep with the workers.
+// need redeploying in lockstep with the workers. "Latest" is the version that
+// registered most recently, and workers on any other version never dequeue
+// such a run: a fleet relaunched on an older version string, or left behind by
+// a process that registered a newer one, stops receiving Client traffic
+// without an error. Launch warns when that is the case, and so does
+// WithStaleRunWarning when it becomes the case later.
 func WithClientApplicationVersion(version string) EnqueueOption {
 	return func(c *enqueueConfig) { c.appVersion = version }
 }

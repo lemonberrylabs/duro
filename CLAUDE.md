@@ -199,6 +199,16 @@ Single flat package at the repo root:
   `duro: run error` in an api tier, and nothing local reproduces it because
   dev runs the engine. Pass both flags explicitly on every `ListWorkflows`
   call; pinned by `TestClientFailedRunExposesError`.
+- **A run with no recorded application version belongs to the latest
+  registered version, not to "any" version.** DBOS v1's dequeue adds
+  `OR application_version IS NULL` only for the executor whose version is the
+  newest row in `application_versions` (v0.18 added it for everyone), and a
+  Client stamps NULL by default. Anything that reasons about which runs this
+  fleet can run — the stale-run split (`splitStaleRuns`), a warning, a doc —
+  must ask `latestApplicationVersion` rather than compare version strings;
+  `Launch` and the stale-run warning both warn when the executor is not on it.
+  Pinned by `TestSplitStaleRuns`, `TestStaleRunWarningFollowsLatestVersion`
+  and `TestLaunchWarnsWhenNotOnLatestVersion`.
 - **Client reads must go through `readContext`, once per public call**, never
   `c.c.ListWorkflows` and friends on the root `dbos.Client`: although the v1
   interface embeds `context.Context`, it does not expose the DBOS context-

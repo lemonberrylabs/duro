@@ -74,12 +74,17 @@ type querier interface {
 // StaleRunInfo reports the counts a stale-run warning surfaces on each sweep
 // (see WithStaleRunWarning). Stranded runs otherwise emit no signal at all.
 type StaleRunInfo struct {
-	// SameVersion counts non-terminal runs older than the warning age on this
-	// executor's application version — in limbo, but recoverable by this fleet.
+	// SameVersion counts non-terminal runs older than the warning age that this
+	// executor's application version can run — in limbo, but recoverable by
+	// this fleet. Runs recorded with no version (a Client's default enqueue)
+	// count here while this version is the latest registered one: DBOS hands
+	// them to the latest version only.
 	SameVersion int
-	// OtherVersion counts non-terminal runs older than the warning age on other
-	// application versions — not recoverable here until an executor on their
-	// version runs (see Config.ApplicationVersion).
+	// OtherVersion counts non-terminal runs older than the warning age that
+	// this version cannot run: runs on other application versions, and runs
+	// with no version while another version is the latest registered — not
+	// recoverable here until an executor on the right version runs (see
+	// Config.ApplicationVersion).
 	OtherVersion int
 }
 
@@ -280,6 +285,11 @@ type workerPool struct {
 
 	// closeOnce keeps a second Close from tombstoning against a closed pool.
 	closeOnce sync.Once
+
+	// notLatestWarned is whether the stale-run warning last found this
+	// executor off the latest registered application version. Touched only by
+	// the maintenance goroutine.
+	notLatestWarned bool
 }
 
 // newWorkerPool opens duro's dedicated pool and ensures the heartbeat table.
@@ -729,13 +739,14 @@ func (w *workerPool) runPruneLeases() {
 // split by whether they can be recovered on this executor's application
 // version, and surfaces them — stranded runs otherwise emit no signal at all.
 func (w *workerPool) runStaleRunWarning() {
-	info, err := w.checkStaleRuns()
+	info, latest, err := w.checkStaleRuns()
 	if err != nil {
 		if w.maintCtx.Err() == nil {
 			w.logger.Warn("duro: worker-pool: stale-run check failed", "error", err)
 		}
 		return
 	}
+	w.noteLatestVersion(latest)
 	if info.SameVersion == 0 && info.OtherVersion == 0 {
 		return
 	}
@@ -746,9 +757,27 @@ func (w *workerPool) runStaleRunWarning() {
 	}
 }
 
+// noteLatestVersion warns when this executor stops being on the latest
+// registered application version, and says so when it is again. It logs on the
+// change rather than every cycle: the condition lasts until someone acts.
+func (w *workerPool) noteLatestVersion(latest string) {
+	notLatest := latest != w.version
+	if notLatest == w.notLatestWarned {
+		return
+	}
+	w.notLatestWarned = notLatest
+	if notLatest {
+		w.logger.Warn(notLatestVersionWarning, "application_version", w.version, "latest_version", latest)
+		return
+	}
+	w.logger.Info("duro: this executor is on the latest registered application version again", "application_version", w.version)
+}
+
 // checkStaleRuns tallies runs created before now-age that are still waiting to
-// run or running, splitting this application version (in limbo, recoverable
-// here) from others (not recoverable until an executor on their version runs).
+// run or running, splitting the ones this application version can run (in
+// limbo, recoverable here) from the rest (not recoverable until an executor on
+// the right version runs). It also returns the latest registered application
+// version, which decides where runs with no recorded version belong.
 //
 // It aggregates in the database rather than listing rows, so the counts are
 // exact however large the backlog — a warning that silently capped its own
@@ -756,7 +785,7 @@ func (w *workerPool) runStaleRunWarning() {
 //
 // DELAYED runs are deliberately excluded: a debounced pipeline parks there by
 // design, so counting them would report healthy work as stranded.
-func (w *workerPool) checkStaleRuns() (StaleRunInfo, error) {
+func (w *workerPool) checkStaleRuns() (StaleRunInfo, string, error) {
 	ctx, cancel := dbos.WithTimeout(w.maintDctx, opTimeout)
 	defer cancel()
 
@@ -770,21 +799,51 @@ func (w *workerPool) checkStaleRuns() (StaleRunInfo, error) {
 		EndTime: time.Now().Add(-w.staleRunWarn), // created_at ≤ cutoff
 	})
 	if err != nil {
-		return StaleRunInfo{}, fmt.Errorf("duro: worker-pool: counting stale runs: %w", err)
+		return StaleRunInfo{}, "", fmt.Errorf("duro: worker-pool: counting stale runs: %w", err)
 	}
+	latest, err := latestApplicationVersion(ctx, w.version)
+	if err != nil {
+		return StaleRunInfo{}, "", fmt.Errorf("duro: worker-pool: reading the latest application version: %w", err)
+	}
+	return splitStaleRuns(rows, w.version, latest == w.version), latest, nil
+}
+
+// splitStaleRuns sums per-version run counts into the runs an executor on
+// version can run and the ones it cannot. A run with no recorded version
+// belongs to whichever version is latest: that is the only one DBOS lets
+// dequeue it.
+func splitStaleRuns(rows []dbos.WorkflowAggregateRow, version string, versionIsLatest bool) StaleRunInfo {
 	var info StaleRunInfo
 	for _, r := range rows {
 		if r.Count == nil {
 			continue
 		}
-		version := r.Group["application_version"]
-		if version != nil && *version == w.version {
+		recorded := r.Group["application_version"]
+		if (recorded == nil && versionIsLatest) || (recorded != nil && *recorded == version) {
 			info.SameVersion += int(*r.Count)
 		} else {
 			info.OtherVersion += int(*r.Count)
 		}
 	}
-	return info, nil
+	return info
+}
+
+// notLatestVersionWarning is logged at Launch and by the stale-run warning.
+const notLatestVersionWarning = "duro: this executor is not on the latest registered application version: DBOS hands runs enqueued with no version — a Client's default — to the latest version only, so it will never dequeue them"
+
+// latestApplicationVersion returns the application version DBOS treats as
+// latest for this application — the only one allowed to dequeue runs recorded
+// with no version. With no version registered at all DBOS treats the asking
+// executor as latest; so does this.
+func latestApplicationVersion(ctx dbos.Context, version string) (string, error) {
+	latest, err := dbos.GetLatestApplicationVersion(ctx)
+	switch {
+	case errors.Is(err, dbos.ErrNoApplicationVersions):
+		return version, nil
+	case err != nil:
+		return "", err
+	}
+	return latest.Name, nil
 }
 
 // --- R5: retention ---------------------------------------------------------
