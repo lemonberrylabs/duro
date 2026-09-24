@@ -263,6 +263,11 @@ type workerPool struct {
 	staleRunWarn      time.Duration
 	staleRunHook      func(StaleRunInfo)
 
+	// tracker records this executor's executions (executions.go). It is set
+	// exactly when enabled: the lease is what bounds a dead executor's open
+	// execution rows.
+	tracker *executionTracker
+
 	// beat* controls the heartbeat goroutine; maint* controls the sweeper,
 	// retention, and stale-run-warning goroutines. They are separate so
 	// Close can stop maintenance first yet keep heartbeating while DBOS unwinds
@@ -334,17 +339,36 @@ func newWorkerPool(ctx context.Context, cfg Config, dctx dbos.Context, o appOpti
 			pool.Close()
 			return nil, err
 		}
+		tracker, err := newExecutionTracker(ctx, cfg.DatabaseURL, w.executorID, logger)
+		if err != nil {
+			pool.Close()
+			return nil, err
+		}
+		w.tracker = tracker
 	}
 	return w, nil
 }
 
-// ensureTable creates the heartbeat table if it does not exist. The dbos schema
-// already exists here — DBOS runs its migrations during NewContext, before
-// duro's New returns.
+// ensureTable creates duro's worker-pool tables and columns if they do not
+// exist. The dbos schema already exists here — DBOS runs its migrations during
+// NewContext, before duro's New returns.
+//
+// The DDL runs in one transaction under an advisory lock: two processes
+// running CREATE TABLE IF NOT EXISTS at the same moment can still collide on
+// the catalog's unique index and fail New, which is exactly what a fleet
+// booting together (a deploy) does.
 func (w *workerPool) ensureTable(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, opTimeout)
 	defer cancel()
-	if _, err := w.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS `+heartbeatTable+` (
+	tx, err := w.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("duro: worker-pool: begin schema transaction: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rolled back unless Commit succeeds first
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, schemaLockKey); err != nil {
+		return fmt.Errorf("duro: worker-pool: schema lock: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS `+heartbeatTable+` (
 		executor_id         TEXT PRIMARY KEY,
 		app_name            TEXT NOT NULL,
 		application_version TEXT NOT NULL,
@@ -354,12 +378,33 @@ func (w *workerPool) ensureTable(ctx context.Context) error {
 		return fmt.Errorf("duro: worker-pool: creating heartbeat table: %w", err)
 	}
 	// Tables created by an earlier duro version predate the nonce column.
-	if _, err := w.pool.Exec(ctx, `ALTER TABLE `+heartbeatTable+
+	if _, err := tx.Exec(ctx, `ALTER TABLE `+heartbeatTable+
 		` ADD COLUMN IF NOT EXISTS nonce TEXT NOT NULL DEFAULT ''`); err != nil {
 		return fmt.Errorf("duro: worker-pool: adding heartbeat nonce column: %w", err)
 	}
+	// Each executor publishes the stale threshold it heartbeats against, so a
+	// reader judging its liveness (Unsettled, possibly from a Client that
+	// knows nothing of the fleet's cadence) uses the executor's own. Rows an
+	// earlier duro version keeps writing get the default threshold.
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN IF NOT EXISTS stale_after_ms BIGINT NOT NULL DEFAULT %d`,
+		heartbeatTable, defaultStaleThreshold.Milliseconds())); err != nil {
+		return fmt.Errorf("duro: worker-pool: adding heartbeat stale threshold column: %w", err)
+	}
+	if _, err := tx.Exec(ctx, createExecutionsSQL); err != nil {
+		return fmt.Errorf("duro: worker-pool: creating executions table: %w", err)
+	}
+	if _, err := tx.Exec(ctx, createExecutionsIndexSQL); err != nil {
+		return fmt.Errorf("duro: worker-pool: creating executions index: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("duro: worker-pool: commit schema transaction: %w", err)
+	}
 	return nil
 }
+
+// schemaLockKey names the advisory lock ensureTable holds. It is shared by
+// every duro app on the database, since the tables are too.
+const schemaLockKey = "duro:schema"
 
 // claimLease writes this process's lease unconditionally, taking ownership of
 // the executor ID. It runs once, before DBOS launches: a restart legitimately
@@ -368,14 +413,15 @@ func (w *workerPool) claimLease(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, opTimeout)
 	defer cancel()
 	_, err := w.pool.Exec(ctx, `INSERT INTO `+heartbeatTable+`
-		(executor_id, app_name, application_version, last_heartbeat, nonce)
-		VALUES ($1, $2, $3, now(), $4)
+		(executor_id, app_name, application_version, last_heartbeat, nonce, stale_after_ms)
+		VALUES ($1, $2, $3, now(), $4, $5)
 		ON CONFLICT (executor_id) DO UPDATE SET
 			app_name            = EXCLUDED.app_name,
 			application_version = EXCLUDED.application_version,
 			last_heartbeat      = now(),
-			nonce               = EXCLUDED.nonce`,
-		w.executorID, w.appName, w.version, w.nonce)
+			nonce               = EXCLUDED.nonce,
+			stale_after_ms      = EXCLUDED.stale_after_ms`,
+		w.executorID, w.appName, w.version, w.nonce, w.staleThreshold.Milliseconds())
 	return err
 }
 
@@ -393,14 +439,15 @@ func (w *workerPool) beat(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, opTimeout)
 	defer cancel()
 	tag, err := w.pool.Exec(ctx, `INSERT INTO `+heartbeatTable+`
-		(executor_id, app_name, application_version, last_heartbeat, nonce)
-		VALUES ($1, $2, $3, now(), $4)
+		(executor_id, app_name, application_version, last_heartbeat, nonce, stale_after_ms)
+		VALUES ($1, $2, $3, now(), $4, $5)
 		ON CONFLICT (executor_id) DO UPDATE SET
 			app_name            = EXCLUDED.app_name,
 			application_version = EXCLUDED.application_version,
-			last_heartbeat      = now()
+			last_heartbeat      = now(),
+			stale_after_ms      = EXCLUDED.stale_after_ms
 		WHERE `+heartbeatTable+`.nonce = EXCLUDED.nonce`,
-		w.executorID, w.appName, w.version, w.nonce)
+		w.executorID, w.appName, w.version, w.nonce, w.staleThreshold.Milliseconds())
 	if err != nil {
 		return err
 	}
@@ -432,6 +479,13 @@ func (w *workerPool) firstBeat(ctx context.Context) error {
 	if err := w.claimLease(ctx); err != nil {
 		return fmt.Errorf("duro: worker-pool: initial heartbeat: %w", err)
 	}
+	if w.tracker != nil {
+		ctx, cancel := context.WithTimeout(ctx, opTimeout)
+		defer cancel()
+		if _, err := w.tracker.pool.Exec(ctx, closeOrphanedSQL, w.executorID); err != nil {
+			return fmt.Errorf("duro: worker-pool: closing a previous process's executions: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -445,6 +499,8 @@ func (w *workerPool) start() {
 	if w.enabled {
 		w.beatWG.Add(1)
 		go w.heartbeatLoop()
+		w.maintWG.Add(1)
+		go w.executionLoop()
 	}
 	w.startMaintenance()
 }
@@ -480,6 +536,25 @@ func (w *workerPool) heartbeatLoop() {
 			default:
 				w.logger.Warn("duro: worker-pool: heartbeat failed", "executor_id", w.executorID, "error", err)
 			}
+		}
+	}
+}
+
+// executionLoop drives the execution tracker's poll (cancellation and failed
+// closes) on the heartbeat cadence, so a cancelled run's stage is interrupted
+// within about one heartbeat interval. It runs in the maintenance scope, on
+// its own goroutine and the tracker's own pool: it must neither wait behind a
+// sweep nor delay a beat.
+func (w *workerPool) executionLoop() {
+	defer w.maintWG.Done()
+	t := time.NewTicker(w.heartbeatInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-w.maintCtx.Done():
+			return
+		case <-t.C:
+			w.tracker.poll(w.maintCtx)
 		}
 	}
 }
@@ -705,10 +780,25 @@ const pruneLeasesSQL = `DELETE FROM ` + heartbeatTable + ` h
 		         AND (ws.application_name = h.app_name OR ws.application_name IS NULL)
 		  )`
 
-// pruneLeases removes long-dead leases; see pruneLeasesSQL.
+// pruneExecutionsSQL deletes the execution rows of executors whose leases are
+// long dead, on the same horizon as pruneLeasesSQL. It does not share that
+// statement's PENDING guard: a dead executor's rows count for nothing in
+// Unsettled whether or not its lease survives, so they can always go.
+const pruneExecutionsSQL = `DELETE FROM ` + executionsTable + ` e
+	USING ` + heartbeatTable + ` h
+	WHERE e.executor_id = h.executor_id
+	  AND h.app_name = $1
+	  AND h.last_heartbeat < now() - make_interval(secs => $2)`
+
+// pruneLeases removes long-dead leases and their execution rows; see
+// pruneLeasesSQL and pruneExecutionsSQL. The rows go first: a lease deleted
+// before them would leave rows nothing ever matches again.
 func (w *workerPool) pruneLeases(ctx context.Context) (int64, error) {
 	ctx, cancel := context.WithTimeout(ctx, opTimeout)
 	defer cancel()
+	if _, err := w.pool.Exec(ctx, pruneExecutionsSQL, w.appName, w.leasePruneAge.Seconds()); err != nil {
+		return 0, fmt.Errorf("duro: worker-pool: pruning execution rows: %w", err)
+	}
 	tag, err := w.pool.Exec(ctx, pruneLeasesSQL,
 		w.appName,
 		w.leasePruneAge.Seconds(),
@@ -907,6 +997,13 @@ func (w *workerPool) sweepRetention() (int, error) {
 			return fmt.Errorf("duro: worker-pool: deleting expired runs: %w", err)
 		}
 		deleted = len(ids)
+		if w.enabled {
+			// The runs are gone, so nothing asks about their executions. A
+			// failure here leaves rows that go with their executor's lease.
+			if _, err := w.pool.Exec(ctx, `DELETE FROM `+executionsTable+` WHERE workflow_uuid = ANY($1)`, ids); err != nil {
+				return fmt.Errorf("duro: worker-pool: deleting expired runs' execution rows: %w", err)
+			}
+		}
 		return nil
 	})
 	return deleted, err
@@ -936,7 +1033,12 @@ func (w *workerPool) stopBeat() {
 	w.beatWG.Wait()
 }
 
-func (w *workerPool) close() { w.pool.Close() }
+func (w *workerPool) close() {
+	w.pool.Close()
+	if w.tracker != nil {
+		w.tracker.close()
+	}
+}
 
 // generateExecutorID mints a process-unique executor identity for worker-pool
 // mode. A hostname prefix keeps it recognizable in logs and the heartbeat

@@ -36,8 +36,11 @@ var ErrRunInFlight = errors.New("duro: run was cancelled mid-execution and its i
 type execFunc func(ctx context.Context, sql string, args ...any) (int64, error)
 
 // Cancel stops a live run: an enqueued or delayed run never starts, and a
-// pending one stops at its next stage boundary (the stage in flight finishes
-// — keep stages idempotent). The run's queue is cleared and its state becomes
+// pending one stops at its next stage boundary. In worker-pool mode the
+// executor running it also cancels the in-flight stage's context within about
+// a heartbeat interval, so a stage that honors its context stops early;
+// without worker-pool mode the stage in flight finishes. Keep stages
+// idempotent either way. Unsettled reports when the stage has returned. The run's queue is cleared and its state becomes
 // StateCancelled. Runs already in a final state return ErrRunTerminal, so a
 // cancel that changed nothing is never mistaken for one that did; unknown IDs
 // return ErrRunNotFound.

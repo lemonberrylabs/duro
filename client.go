@@ -324,3 +324,14 @@ func (c *Client) Resume(workflowID string) error {
 	defer done()
 	return resumeRun(c.storeOn(dctx), workflowID)
 }
+
+// Unsettled reports which runs are not yet final or may still be executing,
+// as the engine's Unsettled does, on the client's own connection. It needs
+// the fleet it reads to run in worker-pool mode, which tracks executions; a
+// database no worker-pool executor has used has no execution table, and the
+// call fails rather than guess.
+func (c *Client) Unsettled(workflowIDs ...string) ([]UnsettledRun, error) {
+	dctx, done := c.readContext()
+	defer done()
+	return unsettledRuns(dctx, poolQuery(c.pool), workflowIDs)
+}

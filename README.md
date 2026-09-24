@@ -599,8 +599,10 @@ non-terminal is visible rather than hidden. The unsuffixed
 
 ### Cancelling and resuming
 
-`Cancel` stops a live run at its next stage boundary (the stage in flight
-completes and is checkpointed); `Resume` revives a run under the same ID,
+`Cancel` stops a live run at its next stage boundary; in worker-pool mode the
+executor running it also cancels the in-flight stage's context within about a
+heartbeat interval, so a stage that honors its context stops there (see
+[Settled runs](#settled-runs)). `Resume` revives a run under the same ID,
 replaying its checkpoints and continuing from the first stage that never
 finished:
 
@@ -626,6 +628,43 @@ run up, cannot both apply. A resumed run that still records its queue goes
 back on it; DBOS clears the queue when it cancels or dead-letters a run, so in
 practice a resumed run executes on DBOS's internal queue, outside its original
 queue's limits.
+
+### Settled runs
+
+A cancelled run is final at once, but the stage it was executing is not
+stopped by the database write: it runs until it returns. Before starting work
+that must not overlap an old run — a replacement run that writes the same
+records, say — ask whether the old runs are *settled*: final, and none of
+their code still executing anywhere.
+
+```go
+runs, err := app.Unsettled(ctx, runIDs...) // or client.Unsettled(runIDs...)
+if len(runs) > 0 {
+	// runs[i].State is not final yet, or runs[i].Executing: a worker may
+	// still be inside one of its stages. Check again later.
+}
+```
+
+The answer comes from execution tracking, which worker-pool mode turns on:
+each executor records every execution of a registered pipeline before its
+first stage and closes the record after its last stage returns, and a record
+left open by a process that died stops counting once that executor's lease
+goes stale. No time window is involved; a run is settled the moment its last
+stage returns. To make that moment come soon, each executor polls the runs it
+is executing on the heartbeat cadence and cancels the context of any that was
+cancelled: a stage that honors its context stops within about a heartbeat
+interval, its remaining retries are skipped, and the context's cause is the
+run's cancellation. DBOS records the interrupted stage's error as its outcome
+(visible in `Steps`); the run stays cancelled.
+
+Two kinds of execution leave no record: runs on an executor running a duro
+version without tracking, and hand-written workflows (`RegisterWorkflow`,
+`duro.Workflow`), whose bodies duro does not wrap. A run of either kind that
+was cancelled after it started counts as executing for as long as its
+executor's lease is live. While a fleet is only partly on a tracking duro
+version (a rolling deploy), a run adopted by or finished on an older executor
+can read as settled early; check again once every executor is upgraded. `App.Unsettled`
+refuses outside worker-pool mode, and `Unsettled` needs the whole fleet in it.
 
 ### Forking from a stage
 
@@ -667,7 +706,9 @@ no wait. A run taken over goes back on the queue it came from, so it stays subje
 to that queue's concurrency and rate limits; only a run started directly (which
 has no queue) is re-enqueued on DBOS's internal queue. Takeover guarantees
 exactly-once workflow completion but, like all DBOS recovery, at-least-once step
-side effects — keep steps idempotent. Tune the
+side effects — keep steps idempotent. Worker-pool mode also records each
+executor's executions and interrupts cancelled runs' stages — see
+[Settled runs](#settled-runs). Tune the
 cadence (defaults: 10s heartbeat / 60s stale / 30s sweep) with
 `WithHeartbeatInterval`, `WithStaleThreshold`, `WithSweepInterval`; `New` rejects
 a stale threshold under 2× the heartbeat interval, since a threshold that tight
@@ -720,7 +761,7 @@ runs, err := c.ListRuns(duro.WithStates(duro.StateRetriesExceeded)) // the admin
 ```
 
 A named `Client` carries the whole read and remediation surface — `Status`,
-`StatusAll`, `ListRuns`, `Steps`, `Cancel`, `Resume` — as thin calls into the
+`StatusAll`, `ListRuns`, `Steps`, `Cancel`, `Resume`, `Unsettled` — as thin calls into the
 same core the engine's functions use. It sees that application's runs plus
 unclaimed migrated rows. Leave `ApplicationName` blank only for a deliberate
 cross-application admin client; ID-addressed operations can also cross
@@ -864,7 +905,8 @@ whole feature set:
 - [`examples/fleet`](examples/fleet) — **worker-pool mode**: a two-process app —
   a `duro.New`+`WithWorkerPool` worker fleet and a `duro.NewClient` web tier that
   enqueues without an engine, and a `-role=admin` view on the same `Client` that
-  lists the fleet's runs, dumps a run's checkpoints, and cancels or resumes one —
+  lists the fleet's runs, dumps a run's checkpoints, cancels or resumes one, and
+  reports whether a cancelled run's stage has actually stopped —
   plus a `-crash` flag that kills a worker mid-run so you can watch a survivor's
   sweeper take the run over and finish it, replaying the checkpointed steps and
   re-running only the in-flight one.

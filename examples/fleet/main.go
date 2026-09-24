@@ -1,7 +1,8 @@
 // Command fleet demonstrates duro's worker-pool mode: a fleet of interchangeable
 // workers that recover each other's runs, an enqueue-only web tier that starts
 // work without running an engine, and an admin view on that same client that
-// lists, inspects, cancels, and resumes runs. See the README for the walkthrough.
+// lists, inspects, cancels, and resumes runs, and checks whether a run is
+// settled. See the README for the walkthrough.
 package main
 
 import (
@@ -42,6 +43,7 @@ func main() {
 	crash := flag.Bool("crash", false, "worker only: start a job then crash mid-run (simulates kill -9)")
 	cancelID := flag.String("cancel", "", "admin only: cancel the run with this ID before listing")
 	resumeID := flag.String("resume", "", "admin only: resume the run with this ID before listing (retries-exceeded, or cancelled before it started)")
+	settledID := flag.String("settled", "", "admin only: report whether the run with this ID is final and none of its code is still running")
 	flag.Parse()
 
 	switch *role {
@@ -50,7 +52,7 @@ func main() {
 	case "web":
 		runWeb()
 	case "admin":
-		runAdmin(*cancelID, *resumeID)
+		runAdmin(*cancelID, *resumeID, *settledID)
 	default:
 		fatal("unknown -role %q (want worker | web | admin)", *role)
 	}
@@ -142,7 +144,7 @@ func runWeb() {
 // — whatever process ran it — and dump the newest one's checkpoints. Nothing
 // here needs the pipeline registered; the client reads through the same
 // mapping the workers use, so the states it prints are the workers' states.
-func runAdmin(cancelID, resumeID string) {
+func runAdmin(cancelID, resumeID, settledID string) {
 	c, err := duro.NewClient(context.Background(), duro.ClientConfig{
 		DatabaseURL:     databaseURL(),
 		ApplicationName: appName,
@@ -161,6 +163,9 @@ func runAdmin(cancelID, resumeID string) {
 	}
 	if resumeID != "" {
 		remediate("resume", resumeID, c.Resume(resumeID))
+	}
+	if settledID != "" {
+		reportSettled(c, settledID)
 	}
 
 	runs, err := c.ListRuns(
@@ -220,6 +225,26 @@ func remediate(what, id string, err error) {
 	}
 }
 
+// reportSettled says whether a run is final with none of its code running —
+// the check to make before starting work that must not overlap it. A run
+// cancelled mid-stage is final at once, but unsettled until the worker's
+// stage has actually returned.
+func reportSettled(c *duro.Client, id string) {
+	runs, err := c.Unsettled(id)
+	switch {
+	case errors.Is(err, duro.ErrRunNotFound):
+		fatal("settled %s: no such run", id)
+	case err != nil:
+		fatal("settled %s: %v", id, err)
+	case len(runs) == 0:
+		fmt.Printf("[admin] %s is settled: final, and none of its code is running\n", id)
+	case runs[0].Executing:
+		fmt.Printf("[admin] %s is %s and a worker may still be executing it\n", id, runs[0].State)
+	default:
+		fmt.Printf("[admin] %s is %s: not final yet\n", id, runs[0].State)
+	}
+}
+
 // resizePipeline is a fake image resize: decode → resize (slow) → encode. Each
 // step logs the executor that ran it, so after a takeover you can see the
 // checkpointed decode step replay (no re-log) while the survivor re-runs the
@@ -231,10 +256,17 @@ func resizePipeline(execID string) duro.Pipeline[string, string] {
 			log("decode %s", name)
 			return "decoded:" + name, nil
 		}),
-		duro.Step("resize", func(_ context.Context, in string) (string, error) {
+		// resize honors its context: cancelling the run interrupts it
+		// within about a heartbeat interval instead of letting it finish.
+		duro.Step("resize", func(ctx context.Context, in string) (string, error) {
 			for i := 1; i <= 10; i++ {
 				log("resize %d/10", i)
-				time.Sleep(time.Second)
+				select {
+				case <-ctx.Done():
+					log("resize interrupted: %v", context.Cause(ctx))
+					return "", ctx.Err()
+				case <-time.After(time.Second):
+				}
 			}
 			return "resized:" + in, nil
 		}),

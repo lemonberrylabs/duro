@@ -27,6 +27,8 @@ across terminals you can watch work move between workers.
 | `Client.ListRuns` + `Client.Steps` | `-role=admin` lists the fleet's newest runs (state, attempts, queue, executor, input) and dumps the newest run's checkpoints |
 | `ClientConfig.ReadTimeout` | the admin client bounds every read at 10s, so a database outage fails the command instead of hanging it |
 | `Client.Cancel` / `Client.Resume` | `-role=admin -cancel ID` stops a live run at its next stage; `-resume ID` revives a run no executor can still be running (retries-exceeded, or cancelled before it started) under the same ID |
+| `Client.Unsettled` | `-role=admin -settled ID` reports whether a run is final with none of its code still running on a worker |
+| Cancellation stops work | `resize` honors its context, so cancelling a run interrupts it within a heartbeat instead of letting it finish |
 | `ErrRunInFlight` | `-resume` on a run cancelled mid-stage is refused: the stage may still be running, and only `ForkFromStage` (on a worker) re-runs it safely |
 | `WithStaleRunWarning` | workers warn about non-terminal runs older than 15s |
 | Queue-preserving takeover | `resize-jobs` is capped at `WithConcurrency(2)`; an adopted run returns to it, so a crash cannot exceed the cap |
@@ -84,19 +86,29 @@ Remediation uses the same client. Start a job and cancel it while `resize` is
 still counting:
 
 ```bash
-go run . -role=admin -cancel <run-id>    # the in-flight stage finishes, the run stops at `encode`
-go run . -role=admin -resume <run-id>    # refused: ErrRunInFlight
+go run . -role=admin -cancel <run-id> -settled <run-id>   # cancelled, but a worker may still be executing it
+go run . -role=admin -settled <run-id>                    # a second later: settled
+go run . -role=admin -resume <run-id>                     # refused: ErrRunInFlight
 ```
 
-Watch the worker: after the cancel it logs the rest of `resize N/10` — a stage
-in flight completes and checkpoints; cancellation lands at the next stage
-boundary — and nothing more. The resume is refused, and that is the point: the
-database says `cancelled`, but not whether the worker is still inside `resize`
-(it is, for up to ten seconds, and nothing DBOS records says when it leaves).
-Resuming under the same ID could run the stage twice, so `Resume` never does
-it, not even after the worker has visibly moved on. The safe re-run is
-`duro.ForkFromStage` on a worker: a new run that copies the checkpoints and
-finishes, while this one stays cancelled.
+Watch the worker: within about a heartbeat of the cancel it logs `resize
+interrupted` and nothing more. The worker polls the state of the runs it is
+executing and cancels the context of one that was cancelled, so a stage that
+honors its context stops there instead of finishing, and `encode` never runs.
+A stage that ignores its context keeps running to its end, and cancellation
+lands at the next stage boundary.
+
+`-settled` tells the two moments apart. Right after the cancel the run is
+already `cancelled`, but the worker may still be inside `resize`; once the stage
+has returned, the run is settled: final, with none of its code running. Every
+worker records its executions against its heartbeat lease, so a worker that
+dies mid-stage stops counting once its lease goes stale. That is the check to
+make before starting a replacement that must not overlap the old run.
+
+The resume is still refused, even once the run is settled: `Resume` keeps its
+rule of reviving only runs that never started. The re-run for a run cancelled
+mid-stage is `duro.ForkFromStage` on a worker: a new run that copies the
+checkpoints and finishes, while this one stays cancelled.
 
 `Resume` is for runs no executor can be running. Cancel one before it ever
 starts — no worker up, so the job waits on its queue — then resume it and

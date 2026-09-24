@@ -59,6 +59,21 @@ func Parallel[T, R any](name string, maxConcurrent int, fn func(ctx context.Cont
 				failed = true
 				dest.ErrorWithContext(ctx, err)
 			}
+			// drainLaunched waits out every step already launched before an
+			// error leaves the stage, so no step outlives the workflow on
+			// the failure path either: a step still running after its
+			// workflow returned would be invisible to Unsettled and would
+			// checkpoint into a finished run. With WithCancelSiblingSteps
+			// the in-flight steps are cancelled first.
+			drainLaunched := func(cause error) {
+				if cancelSiblings {
+					fireSignal(cause)
+				}
+				for _, ch := range outcomes {
+					<-ch
+				}
+				outcomes = nil
+			}
 
 			sub := source.SubscribeWithContext(subCtx, ro.NewObserverWithContext(
 				func(ctx context.Context, in T) {
@@ -67,6 +82,7 @@ func Parallel[T, R any](name string, maxConcurrent int, fn func(ctx context.Cont
 					}
 					state, err := stageState(ctx, name)
 					if err != nil {
+						drainLaunched(err)
 						fail(ctx, err)
 						return
 					}
@@ -84,7 +100,9 @@ func Parallel[T, R any](name string, maxConcurrent int, fn func(ctx context.Cont
 							<-sem
 						}
 						state.aborted.Store(true)
-						fail(ctx, fmt.Errorf("duro: stage %q: starting parallel step: %w", name, err))
+						err = fmt.Errorf("duro: stage %q: starting parallel step: %w", name, err)
+						drainLaunched(err)
+						fail(ctx, err)
 						return
 					}
 					if sem == nil && !cancelSiblings {
@@ -108,7 +126,11 @@ func Parallel[T, R any](name string, maxConcurrent int, fn func(ctx context.Cont
 					}()
 					outcomes = append(outcomes, watched)
 				},
-				dest.ErrorWithContext,
+				func(ctx context.Context, err error) {
+					// An upstream stage failed after this one launched steps.
+					drainLaunched(err)
+					fail(ctx, err)
+				},
 				func(ctx context.Context) {
 					if failed {
 						return

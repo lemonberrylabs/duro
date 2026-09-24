@@ -44,7 +44,13 @@ type Config struct {
 // applicationRuntime is the in-process identity of one App. It distinguishes
 // Apps with the same durable application name against different databases
 // when resolving DBOS v1's database-backed queue handles and Duro registries.
-type applicationRuntime struct{ name string }
+type applicationRuntime struct {
+	name string
+	// tracker is the App's execution tracker, set in worker-pool mode. It
+	// is reached through workflow contexts, which carry this value, so a
+	// pipeline run finds the tracker of the App that executes it.
+	tracker atomic.Pointer[executionTracker]
+}
 
 // applicationRuntimeContextKey carries that identity into workflow contexts
 // without deriving the DBOS root. DBOS v1 deliberately strips root lifecycle
@@ -147,7 +153,8 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*App, error) {
 	if o.workerPool && cfg.ExecutorID == "" && os.Getenv("DBOS__VMID") == "" {
 		cfg.ExecutorID = generateExecutorID()
 	}
-	ctx = context.WithValue(ctx, applicationRuntimeContextKey{}, &applicationRuntime{name: cfg.Name})
+	runtime := &applicationRuntime{name: cfg.Name}
+	ctx = context.WithValue(ctx, applicationRuntimeContextKey{}, runtime)
 	dctx, err := dbos.NewContext(ctx, dbos.Config{
 		AppName:            cfg.Name,
 		DatabaseURL:        cfg.DatabaseURL,
@@ -175,6 +182,9 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*App, error) {
 			return nil, err
 		}
 		app.wp = wp
+		if wp.tracker != nil {
+			runtime.tracker.Store(wp.tracker)
+		}
 	}
 	return app, nil
 }

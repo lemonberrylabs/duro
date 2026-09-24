@@ -98,6 +98,11 @@ Single flat package at the repo root:
 - `workerpool.go` — worker-pool mode: `WithWorkerPool` (+ cadence options),
   `WithRetention`, `WithStaleRunWarning`; the heartbeat lease, sweeper +
   liveness takeover, retention, all on a dedicated pgx pool
+- `executions.go` — execution tracking (worker-pool mode): `executionTracker`
+  records each tracked execution in `dbos.duro_run_executions` and cancels a
+  running run's context once its row turns CANCELLED; `executeTracked` wraps
+  `PipelineWorkflow.run`, the scheduled dispatcher and the cancel watcher;
+  `unsettledRuns` is the shared core of `App.Unsettled`/`Client.Unsettled`
 - `client.go` — enqueue-only `Client`: `NewClient`, generic `Enqueue`, and the
   full read/remediation surface (`Status`/`StatusAll`/`ListRuns`/`Steps`/
   `Cancel`/`Resume`) as thin calls into the same `runStore` cores the engine
@@ -183,8 +188,10 @@ Single flat package at the repo root:
   have the second re-enqueue a run the first one's worker is already
   executing. The `recovery_attempts = 0` half is the quiescence rule:
   CANCELLED does **not** mean the executor stopped — cancellation lands at the
-  next step start, the in-flight stage runs to completion, and nothing in the
-  schema records the goroutine's exit — so a run cancelled after any start is
+  next step start, the in-flight stage runs until it returns, and DBOS's
+  schema records nothing about the goroutine's exit (execution tracking does,
+  but only in worker-pool mode, and it is not what `Resume` is keyed on) — so
+  a run cancelled after any start is
   refused forever (`ErrRunInFlight`; the remedy is `ForkFromStage`). Do not
   "fix" that by waiting or guessing. Like takeover it is coupled to DBOS's
   schema; unlike takeover it resets `recovery_attempts` on purpose (an
@@ -222,6 +229,33 @@ Single flat package at the repo root:
   `Canceled`. `Enqueue` and `Handle` waits still hang; documented, not fixable
   from duro. Pinned by `TestClientReadTimeoutBoundsBlockedRead` and
   `TestClientWithContextDeadlineIsDeadline`.
+- **`Unsettled` is exact only because of three orderings; keep all three.**
+  (1) An execution row is written before the body's first stage and closed
+  only after the body returns, and Parallel drains every launched step before
+  any error leaves the stage (`drainLaunched`) — a step that outlives its
+  workflow body is invisible. (2) `unsettledSQL` reads state and rows in one
+  statement (one snapshot): a stage running at that snapshot either has an open
+  row in it or started after it, and DBOS checks cancellation at stage start.
+  (3) Rows are kept after they close (`ended_at`), because a started,
+  cancelled run with *no row on any executor* means "ran untracked" (older
+  duro, hand-written workflow) and must read as executing while the executor
+  named on its status is live — "any executor", since DBOS rewrites
+  `executor_id` when a caller re-starts an existing ID. A process claiming an
+  executor ID closes that ID's open rows first (`closeOrphanedSQL`), or a
+  reused ID would revive a crashed predecessor's rows. Rows go with their run
+  (retention) or with their executor's pruned lease, never sooner. Liveness is
+  judged by each executor's own published `stale_after_ms`, since a Client
+  cannot know the fleet's threshold. The tracker has its own pool: sharing the
+  heartbeat's would let a burst of run starts delay beats. Pinned by
+  `TestUnsettledPredicate`, `TestUnsettledWhileUncooperativeStageRuns`,
+  `TestUnsettledCrashedExecutorSettles`, `TestUnsettledUntrackedWorkflow` and
+  `TestParallelDrainsLaunchedStepsOnUpstreamError`.
+- **Cancellation interrupts tracked stages through duro's own child context**,
+  not DBOS's workflow context (unreachable), so DBOS checkpoints the
+  interrupted stage's error instead of skipping the checkpoint as it does for
+  its own cancellation. The run is CANCELLED and `Resume` refuses started
+  cancelled runs, so the checkpoint is never replayed; do not relax
+  `resumeSQL`'s `recovery_attempts = 0` rule without accounting for it.
 - `go build` in `examples/` drops binaries (e.g. `housekeeping`, `fleet`) —
   don't commit them.
 - Open an issue before behavior changes or new primitives (per CONTRIBUTING.md).

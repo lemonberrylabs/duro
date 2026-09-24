@@ -42,7 +42,7 @@ func scheduledPipelineDispatcher(ledger *scheduleLedger) dbos.Workflow[dbos.Sche
 		if !ok {
 			return nil, fmt.Errorf("duro: scheduled pipeline %q is not registered for application %q", name, applicationNameFromContext(ctx))
 		}
-		return registration.entry.run(ctx, input.ScheduledTime)
+		return executeTracked(ctx, func(ctx Context) (any, error) { return registration.entry.run(ctx, input.ScheduledTime) })
 	}
 }
 
@@ -110,7 +110,7 @@ func (w *PipelineWorkflow[P, R]) ConfigName() string { return w.name }
 // run executes the pipeline durably; its method value is what Register
 // registers with DBOS.
 func (w *PipelineWorkflow[P, R]) run(ctx Context, in P) (R, error) {
-	return Run(ctx, in, w.p)
+	return executeTracked(ctx, func(ctx Context) (R, error) { return Run(ctx, in, w.p) })
 }
 
 // dbosWorkflow and runOptions implement WorkflowRef, so a registered

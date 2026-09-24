@@ -162,7 +162,9 @@ func WithChildTimeout(d time.Duration) ChildOption {
 //     enqueued). Enqueueing itself never blocks on child completion.
 //
 // Cancellation does not cascade: DBOS cancels exactly the sibling children,
-// and a cancelled child stops at the start of its next step. Workflows the
+// and a cancelled child stops at the start of its next step (in worker-pool
+// mode, a registered-pipeline child's running step also has its context
+// cancelled; see Unsettled). Workflows the
 // cancelled child had itself started — grandchildren of this stage,
 // including a nested FanOut's children — keep running to completion. To
 // bound that cost, give the child's own fan-outs WithCancelSiblings (covers
@@ -503,6 +505,10 @@ type cancelWatchInput struct {
 // watcher simply starts over, which is exactly the idempotent behavior
 // cancellation needs.
 func cancelWatcher(ctx dbos.Context, in cancelWatchInput) (string, error) {
+	return executeTracked(ctx, func(ctx Context) (string, error) { return watchChildren(ctx, in) })
+}
+
+func watchChildren(ctx dbos.Context, in cancelWatchInput) (string, error) {
 	interval := in.PollInterval
 	if interval <= 0 {
 		interval = defaultCancelWatchPollInterval
