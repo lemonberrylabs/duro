@@ -2,10 +2,10 @@
 // ticket triage pipeline: Switch dispatches by category, a nested Branch
 // escalates urgent bugs, Loop durably polls an external system, Sub reuses a
 // shared notification segment, Rescue scopes error handling to a best-effort
-// segment (and to the whole pipeline), Via fans each resolution out to
-// archive systems and passes the resolution through, and Collect folds the
-// batch into a report — all inside one registered pipeline, no hand-written
-// workflow function.
+// segment (and to the whole pipeline), Alongside sends each receipt while Via
+// fans the resolution out to archive systems and passes it through, and
+// Collect folds the batch into a report — all inside one registered pipeline,
+// no hand-written workflow function.
 package main
 
 import (
@@ -165,6 +165,27 @@ var archiveTrail = duro.Pipe2(
 	duro.FanOut("file", archiveQueue, duro.Workflow(ArchiveResolution)),
 )
 
+// --- the receipt (Alongside) -------------------------------------------------
+// The customer's receipt does not depend on the archive filings and should not
+// wait in front of them: Alongside sends it as one step while the archive
+// fan-out runs, and the resolution moves on once both are done. A receipt
+// that cannot be sent is logged and skipped — the handler runs as a
+// checkpointed step, so a replay does not log it twice.
+
+// receiptsSent counts receipts so the demo can show the side step ran (and
+// replays for free).
+var receiptsSent atomic.Int64
+
+func sendReceipt(_ context.Context, r Resolution) error {
+	receiptsSent.Add(1)
+	return nil
+}
+
+func skipReceipt(_ context.Context, r Resolution, cause error) error {
+	fmt.Printf("      [receipt] %s: not sent: %v\n", r.TicketID, cause)
+	return nil // the resolution is still reported
+}
+
 // --- the pipeline ------------------------------------------------------------
 
 var TriagePipeline = duro.Pipe4(
@@ -178,7 +199,9 @@ var TriagePipeline = duro.Pipe4(
 		duro.When("bug", bugArm),
 		duro.When("spam", spamArm),
 	),
-	duro.Via("archive-trail", archiveTrail),
+	duro.Alongside("receipt", sendReceipt, skipReceipt,
+		duro.Pipe1(duro.Via("archive-trail", archiveTrail)),
+		duro.WithMaxRetries(2)),
 	duro.Collect[Resolution]("report"),
 )
 

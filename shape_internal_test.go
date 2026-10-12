@@ -75,6 +75,12 @@ func fpCorpus() []fpCase {
 
 		{"via", Pipe1(Via("v", leaf)).fingerprint()},
 
+		{"alongside", Pipe1(Alongside("al",
+			func(_ context.Context, _ int) error { return nil },
+			func(_ context.Context, _ int, cause error) error { return cause },
+			leaf,
+		)).fingerprint()},
+
 		{"fanout", Pipe3(
 			Expand("x", func(_ context.Context, v int) ([]int, error) { return []int{v}, nil }),
 			FanOut("fo", fpQueue, Workflow(fpChild)),
@@ -114,6 +120,7 @@ var goldenFingerprints = map[string]string{
 	"rescue":                 "rescue:rs[step:leaf-a → step:leaf-b]",
 	"sub":                    "sub:sb[step:leaf-a → step:leaf-b]",
 	"via":                    "via:v[step:leaf-a → step:leaf-b]",
+	"alongside":              "alongside:al[step:leaf-a → step:leaf-b]",
 	"fanout":                 "expand:x → fanout:fo → reduce:sum",
 	"fanout-cancel-siblings": "expand:x → fanout+cancel:fo → reduce:sum",
 	"deeply-nested":          "branch:outer[then=switch:mid[a=sub:deep[step:leaf-a → step:leaf-b] | b=via:deep-via[step:inner]] | else=loop:alt[step:inner]]",

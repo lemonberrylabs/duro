@@ -37,7 +37,7 @@ func main() {
 		{ID: "t-4", Category: "bug"},
 	}
 
-	section("triage run (Switch → nested Branch → Loop → Rescue → Via, one durable workflow)")
+	section("triage run (Switch → nested Branch → Loop → Rescue → Alongside → Via, one durable workflow)")
 	handle, err := triage.Start(app, batch)
 	if err != nil {
 		fatal("starting triage: %v", err)
@@ -52,6 +52,7 @@ func main() {
 	fmt.Printf("   fix-service polls: %d (the urgent bug looped until fixed)\n", pollCalls.Load())
 	fmt.Printf("   loyalty attempts: %d (retries exhausted, then rescued — the refund survived)\n", loyaltyCalls.Load())
 	fmt.Printf("   archive filings: %d child workflows (Via ran the fan-out; the report still carries resolutions)\n", archiveRuns.Load())
+	fmt.Printf("   receipts sent: %d (Alongside ran each one beside its archive fan-out)\n", receiptsSent.Load())
 
 	// Every routing decision, loop iteration, and rescue decision is a
 	// checkpoint: re-running the same workflow ID replays the whole triage
