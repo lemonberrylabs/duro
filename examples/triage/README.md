@@ -21,6 +21,7 @@ go run .    # or: DBOS_SYSTEM_DATABASE_URL=... go run .
 | `Rescue` (whole-pipeline except block) | `GuardedTriagePipeline` wraps the entire triage: report the failure, then rethrow it |
 | `Sub` | one shared `notify` segment reused by three arms under different names |
 | `Via` | each resolution fans out to two archive systems as child workflows on a queue; the filings' results are discarded and the resolution flows on to the report |
+| `Alongside` | each customer's receipt is sent as one step while that archive fan-out runs; a receipt that cannot be sent is logged by the handler and the resolution is still reported |
 | `Collect` | the batch folds into a report of every resolution, in order |
 
 ## How this stays replay-deterministic

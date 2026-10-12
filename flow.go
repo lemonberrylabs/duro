@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/dbos-inc/dbos-transact-golang/dbos"
 	"github.com/samber/ro"
 )
 
@@ -328,6 +329,106 @@ func Via[T, R any](name string, p Pipeline[T, R]) Stage[T, T] {
 		}
 		return ro.Of(in)
 	})}
+}
+
+// Alongside runs side as a durable step concurrently with the embedded
+// pipeline, for each item: the step is launched, the embedded pipeline runs to
+// completion on the workflow goroutine, the step is awaited, and the ORIGINAL
+// item is emitted downstream. It is Via with one step running beside it — for
+// work that is independent of the embedded pipeline (typically a FanOut) and
+// should not sit in front of it. opts configure the side step, like Tap's.
+//
+// Only a single step can run beside the pipeline, never a second pipeline:
+// determinism is preserved because the side step's ID is assigned on the
+// workflow goroutine before the embedded pipeline starts (the same dbos.Go
+// mechanism as Parallel), and every other step is still launched from that
+// goroutine in pipeline order. On recovery a completed side step replays from
+// its checkpoint; one that was in flight re-executes while the embedded
+// pipeline replays.
+//
+// The stage does not complete for an item until both have finished, so no
+// step outlives the stage on any path:
+//
+//   - Both succeed: the original item is emitted; the embedded pipeline's
+//     emissions are discarded, as in Via.
+//   - The embedded pipeline fails: the side step is still awaited (it is not
+//     cancelled), then the stage fails with the embedded pipeline's error.
+//     rescue does not run, whatever the side step's outcome.
+//   - The side step fails — after its own retry policy is exhausted — and the
+//     embedded pipeline succeeded: rescue runs as a checkpointed step and
+//     decides. Return nil to swallow (the original item is emitted and the
+//     outer pipeline continues), or an error to fail the outer pipeline with
+//     it (return cause unchanged to rethrow).
+//
+// rescue follows Rescue's handler contract: it receives the item that entered
+// the stage and a plain error carrying exactly the side step's terminal
+// message, the same value a recovered run replays, so match causes by
+// message. It is required because a Rescue around the stage could not tell a
+// side failure from an embedded one.
+//
+// Applied per item on multi-item streams, in stream order: one item's side
+// step and embedded run finish before the next item starts.
+func Alongside[T, R any](name string, side func(ctx context.Context, in T) error, rescue func(ctx context.Context, in T, cause error) error, p Pipeline[T, R], opts ...StepOption) Stage[T, T] {
+	mustValidStage(kindAlongside, name, side == nil || rescue == nil)
+	resolveCancelSiblings(kindAlongside, name, opts, false)
+	resolveLoopBound(kindAlongside, name, opts, false)
+	mustValidEmbedded(kindAlongside, name, p)
+	return Stage[T, T]{name: name, kind: kindAlongside, nested: []nestedShape{{shape: p.shape}}, queues: p.queues, apply: func(source ro.Observable[T]) ro.Observable[T] {
+		return ro.NewUnsafeObservableWithContext(func(subCtx context.Context, dest ro.Observer[T]) ro.Teardown {
+			failed := false
+			fail := func(ctx context.Context, err error) {
+				failed = true
+				dest.ErrorWithContext(ctx, err)
+			}
+			sub := source.SubscribeWithContext(subCtx, ro.NewObserverWithContext(
+				func(ctx context.Context, in T) {
+					if failed {
+						return
+					}
+					state, err := stageState(ctx, name)
+					if err != nil {
+						fail(ctx, err)
+						return
+					}
+					cfg := newStepConfig(name, opts)
+					body := stepBody(cfg, in, func(stepCtx context.Context, item T) (struct{}, error) {
+						return struct{}{}, side(stepCtx, item)
+					})
+					outcome, err := dbos.Go(state.dctx, body, cfg.dbosOpts...)
+					if err != nil {
+						state.aborted.Store(true)
+						fail(ctx, fmt.Errorf("duro: stage %q: starting side step: %w", name, err))
+						return
+					}
+					_, mainErr := collectSub(ctx, p, in)
+					// Await the side step on every path, so it never outlives
+					// the stage (see Parallel's drainLaunched).
+					sideErr := (<-outcome).Err
+					if mainErr != nil {
+						fail(ctx, mainErr)
+						return
+					}
+					if sideErr != nil {
+						cause := rescueCause(sideErr)
+						if _, err := runStep(ctx, name, in, func(stepCtx context.Context, item T) (struct{}, error) {
+							return struct{}{}, rescue(stepCtx, item, cause)
+						}, nil); err != nil {
+							fail(ctx, err)
+							return
+						}
+					}
+					dest.NextWithContext(ctx, in)
+				},
+				dest.ErrorWithContext,
+				func(ctx context.Context) {
+					if !failed {
+						dest.CompleteWithContext(ctx)
+					}
+				},
+			))
+			return sub.Unsubscribe
+		})
+	}}
 }
 
 // Collect folds the stream into a slice of every item, in order — the

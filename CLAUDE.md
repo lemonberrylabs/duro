@@ -75,7 +75,7 @@ Single flat package at the repo root:
 - `job.go` — `Job[P, R]`/`NewJob`: a pipeline's cross-process identity (name +
   both types) shared by `RegisterJob`, `Enqueue`, and `AttachJob`
 - `run.go` — `Run`/`RunAll`, the hidden `duro.shape` checkpoint
-- `flow.go` — control flow: `Branch`/`Switch`/`When`/`Loop`/`Rescue`/`Sub`/`Via`/`Collect`
+- `flow.go` — control flow: `Branch`/`Switch`/`When`/`Loop`/`Rescue`/`Sub`/`Via`/`Alongside`/`Collect`
 - `fanout.go`, `parallel.go`, `queue.go` — `FanOut` + child options, `Parallel`, `NewQueue`
 - `channels.go`, `signals.go` — typed `Topic`/`Event`/`Stream`; `Delay`/`Send`/
   `Recv`/`SetEvent`/`GetEvent`/`ToStream`/`FromStream`
@@ -122,7 +122,7 @@ Single flat package at the repo root:
 - A registered pipeline's name is its **durable identity** — renaming strands
   in-flight runs (`app.Launch()` warns about them). Same name must be
   registered on every process start.
-- Embedded pipelines (`Branch`/`Switch`/`Loop`/`Rescue`/`Sub`/`Via` arms)
+- Embedded pipelines (`Branch`/`Switch`/`Loop`/`Rescue`/`Sub`/`Via`/`Alongside` arms)
   fold into the shape fingerprint — editing an arm changes the fingerprint.
 - **The shape fingerprint's exact text is on-disk format.** `stageKind` values,
   the `fingerprint*Sep` separators, and the `branchThenKey`/`branchElseKey`
@@ -232,8 +232,8 @@ Single flat package at the repo root:
 - **`Unsettled` is exact only because of three orderings; keep all three.**
   (1) An execution row is written before the body's first stage and closed
   only after the body returns, and Parallel drains every launched step before
-  any error leaves the stage (`drainLaunched`) — a step that outlives its
-  workflow body is invisible. (2) `unsettledSQL` reads state and rows in one
+  any error leaves the stage (`drainLaunched`), as Alongside awaits its side
+  step on every path — a step that outlives its workflow body is invisible. (2) `unsettledSQL` reads state and rows in one
   statement (one snapshot): a stage running at that snapshot either has an open
   row in it or started after it, and DBOS checks cancellation at stage start.
   (3) Rows are kept after they close (`ended_at`), because a started,
@@ -248,8 +248,9 @@ Single flat package at the repo root:
   cannot know the fleet's threshold. The tracker has its own pool: sharing the
   heartbeat's would let a burst of run starts delay beats. Pinned by
   `TestUnsettledPredicate`, `TestUnsettledWhileUncooperativeStageRuns`,
-  `TestUnsettledCrashedExecutorSettles`, `TestUnsettledUntrackedWorkflow` and
-  `TestParallelDrainsLaunchedStepsOnUpstreamError`.
+  `TestUnsettledCrashedExecutorSettles`, `TestUnsettledUntrackedWorkflow`,
+  `TestParallelDrainsLaunchedStepsOnUpstreamError` and
+  `TestAlongsideEmbeddedFailureWins`.
 - **Cancellation interrupts tracked stages through duro's own child context**,
   not DBOS's workflow context (unreachable), so DBOS checkpoints the
   interrupted stage's error instead of skipping the checkpoint as it does for

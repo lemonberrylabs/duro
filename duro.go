@@ -160,6 +160,7 @@ const (
 	kindRescue       stageKind = "rescue"
 	kindSub          stageKind = "sub"
 	kindVia          stageKind = "via"
+	kindAlongside    stageKind = "alongside"
 	kindCollect      stageKind = "collect"
 	kindDelay        stageKind = "delay"
 	kindSend         stageKind = "send"
@@ -178,7 +179,7 @@ type Stage[T, R any] struct {
 	kind   stageKind
 	apply  func(ro.Observable[T]) ro.Observable[R]
 	queues []Queue       // queues this stage enqueues onto (FanOut); Register auto-registers them
-	nested []nestedShape // shapes of embedded pipelines (Branch/Switch/Loop/Rescue/Sub/Via)
+	nested []nestedShape // shapes of embedded pipelines (Branch/Switch/Loop/Rescue/Sub/Via/Alongside)
 }
 
 func (s Stage[T, R]) info() stageInfo {

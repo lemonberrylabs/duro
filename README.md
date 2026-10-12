@@ -204,6 +204,7 @@ DBOS_SYSTEM_DATABASE_URL=postgres://$USER@localhost:5432/quickstart go run .
 | `duro.Rescue(name, pipeline, handler)` | except block: intercept an embedded pipeline's failure — swallow with a fallback or rethrow | ✅ the handler is a checkpointed step |
 | `duro.Sub(name, pipeline)` | embed a pipeline as one named stage (whole-stream) | ✅ its stages checkpoint as usual |
 | `duro.Via(name, pipeline)` | run an embedded pipeline for its effects — typically a fan-out — and pass the original item through | ✅ its stages checkpoint as usual |
+| `duro.Alongside(name, side, rescue, pipeline)` | `Via` with one step running beside it: `side` runs concurrently with the embedded pipeline, and the original item passes through once both finish | ✅ the side step's ID is pre-assigned; a side failure goes to `rescue`, a checkpointed step |
 | `duro.Collect(name)` | fold the stream into a slice of every item | ✅ checkpointed; empty stream → empty slice |
 | `duro.Pure(name, fn)` | cheap reshaping between stages | ❌ re-executes on replay — must be deterministic and side-effect free |
 | `duro.UnsafeOperator(name, op)` | escape hatch for raw ro operators | ⚠️ you're on your own (runtime guards still apply) |
@@ -350,8 +351,28 @@ duro.Pipe3(
 )
 ```
 
+When one independent step should not sit in front of that fan-out,
+`Alongside` is `Via` with the step running beside it: `side` is launched, the
+embedded pipeline runs, the step is awaited, and the original item moves on.
+
+```go
+duro.Alongside("cover-image", generateCover, logAndSkip, // side step + its failure handler
+	unitsPipeline,                                        // runs at the same time
+	duro.WithMaxRetries(3))                               // options configure the side step
+```
+
+Only a single step can run beside the pipeline: its step ID is assigned
+before the embedded pipeline starts (the mechanism `Parallel` uses), which is
+what keeps replay deterministic. The stage finishes only when both have, so
+the side step never outlives it. An embedded failure fails the stage with its
+own error once the side step has returned. A side failure, after the step's
+retries, goes to `rescue`, which runs as a checkpointed step like `Rescue`'s
+handler: return nil to continue without the side effect, or an error to fail
+the pipeline. The handler is required because a `Rescue` around the stage
+could not tell which half failed.
+
 Embedded pipelines fold into the shape fingerprint, so editing an arm or
-body still fails fast on replay. `Branch`/`Switch`/`Loop`/`Rescue`/`Via`
+body still fails fast on replay. `Branch`/`Switch`/`Loop`/`Rescue`/`Via`/`Alongside`
 apply per item; `Sub(name, pipeline)` embeds a segment over the whole stream
 (an inner `Reduce` folds everything). See
 [`examples/triage`](examples/triage).
@@ -896,7 +917,8 @@ whole feature set:
 - [`examples/triage`](examples/triage) — **durable control flow**: Switch
   dispatch, a nested Branch, a polling Loop, shared segments with Sub,
   best-effort and report-then-rethrow error handling with Rescue, an
-  archive fan-out threaded past with Via, and Collect — plus the replay
+  archive fan-out threaded past with Via while a receipt goes out Alongside
+  it, and Collect — plus the replay
   proof that recorded decisions drive the same path.
 - [`examples/housekeeping`](examples/housekeeping) — **operations**: cron
   pipelines, debounced bursts, forking a finished run from a named stage
